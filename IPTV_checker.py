@@ -7,6 +7,8 @@ import time
 import subprocess
 import logging
 import shutil
+import random
+import json
 
 def print_header():
     header_text = """
@@ -36,7 +38,79 @@ def handle_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, handle_sigint)
 
-def check_channel_status(url, timeout, retries=6, extended_timeout=None):
+def test_with_proxy(url, proxy, timeout, retries=3):
+    """
+    Test stream access through a specific proxy
+    """
+    headers = {
+        'User-Agent': 'IPTVChecker 1.0'
+    }
+    
+    try:
+        proxies = {'http': proxy, 'https': proxy}
+        with requests.get(url, stream=True, timeout=(5, timeout), headers=headers, proxies=proxies) as resp:
+            if resp.status_code == 200:
+                content_type = resp.headers.get('Content-Type', '')
+                if ('video/mp2t' in content_type 
+                    or '.ts' in url 
+                    or 'application/vnd.apple.mpegurl' in content_type
+                    or 'application/x-mpegurl' in content_type.lower()):
+                    # Read some data to verify stream
+                    for chunk in resp.iter_content(1024 * 500):  # 500KB
+                        if chunk:
+                            return True
+            return False
+    except Exception as e:
+        logging.debug(f"Proxy test failed with {proxy}: {str(e)}")
+        return False
+
+def load_proxy_list(proxy_file):
+    """
+    Load proxy list from file. Supports formats:
+    - ip:port
+    - protocol://ip:port
+    - JSON format with proxy objects
+    """
+    proxies = []
+    try:
+        with open(proxy_file, 'r') as f:
+            content = f.read().strip()
+            
+            # Try JSON format first
+            try:
+                proxy_data = json.loads(content)
+                if isinstance(proxy_data, list):
+                    for proxy in proxy_data:
+                        if isinstance(proxy, dict):
+                            protocol = proxy.get('protocol', 'http')
+                            ip = proxy.get('ip')
+                            port = proxy.get('port')
+                            if ip and port:
+                                proxies.append(f"{protocol}://{ip}:{port}")
+                        elif isinstance(proxy, str):
+                            proxies.append(proxy)
+                return proxies
+            except json.JSONDecodeError:
+                pass
+            
+            # Plain text format
+            lines = content.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    if '://' not in line:
+                        # Assume HTTP if no protocol specified
+                        line = f'http://{line}'
+                    proxies.append(line)
+                    
+    except FileNotFoundError:
+        logging.error(f"Proxy file not found: {proxy_file}")
+    except Exception as e:
+        logging.error(f"Error loading proxy file: {str(e)}")
+    
+    return proxies
+
+def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False):
     headers = {
         'User-Agent': 'IPTVChecker 1.0'
     }
@@ -54,11 +128,18 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None):
                         logging.debug(f"Rate limit exceeded, retrying...")
                         time.sleep(2)
                         continue
+                    elif resp.status_code in [403, 451, 426]:  # Geoblock indicators
+                        logging.debug(f"Potential geoblock detected: HTTP {resp.status_code}")
+                        return 'Geoblocked'
                     elif resp.status_code == 200:
                         content_type = resp.headers.get('Content-Type', '')
                         logging.debug(f"Content-Type: {content_type}")
 
-                        if 'video/mp2t' in content_type or '.ts' in url or 'application/vnd.apple.mpegurl' in content_type:
+                        # ----- FIXED CONTENT-TYPE CHECK -----
+                        if ('video/mp2t' in content_type 
+                            or '.ts' in url 
+                            or 'application/vnd.apple.mpegurl' in content_type
+                            or 'application/x-mpegurl' in content_type.lower()):
                             for chunk in resp.iter_content(1024 * 1024):  # 1MB chunks
                                 if not chunk:
                                     stable_connection = False
@@ -78,6 +159,9 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None):
                             return 'Dead'
                     else:
                         logging.debug(f"HTTP status code not OK: {resp.status_code}")
+                        # Check for other potential geoblock indicators
+                        if resp.status_code in [401, 423, 451]:
+                            return 'Geoblocked'
                         return 'Dead'
             except requests.ConnectionError:
                 logging.error("Connection error occurred")
@@ -99,6 +183,16 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None):
     if status == 'Dead' and extended_timeout:
         logging.info(f"Channel initially detected as dead. Retrying with an extended timeout of {extended_timeout} seconds.")
         status = attempt_check(extended_timeout)
+    
+    # If geoblocked and proxy testing is enabled, test with proxies
+    if status == 'Geoblocked' and test_geoblock and proxy_list:
+        logging.info(f"Testing geoblocked stream with {len(proxy_list)} proxies...")
+        for proxy in random.sample(proxy_list, min(3, len(proxy_list))):  # Test up to 3 random proxies
+            if test_with_proxy(url, proxy, timeout):
+                logging.info(f"Stream accessible via proxy {proxy} - confirming geoblock")
+                return 'Geoblocked (Confirmed)'
+        logging.info("Stream not accessible via tested proxies")
+        return 'Geoblocked (Unconfirmed)'
 
     # Final Verification using ffmpeg/ffprobe for streams marked alive
     if status == 'Alive':
@@ -116,7 +210,6 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None):
 
     return status
 
-
 def capture_frame(url, output_path, file_name):
     command = [
         'ffmpeg', '-y', '-i', url, '-ss', '00:00:02', '-frames:v', '1',
@@ -129,7 +222,6 @@ def capture_frame(url, output_path, file_name):
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout when trying to capture frame for {file_name}")
         return False
-
 
 def get_stream_info(url):
     command = [
@@ -238,25 +330,42 @@ def write_log_entry(log_file, entry):
         f.write(entry + "\n")
 
 def console_log_entry(current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding):
-    color = "\033[92m" if status == 'Alive' else "\033[91m"
-    status_symbol = '✓' if status == 'Alive' else '✕'
+    # Set colors and symbols based on status
+    if status == 'Alive':
+        color = "\033[92m"  # Green
+        status_symbol = '✓'
+    elif 'Geoblocked' in status:
+        color = "\033[93m"  # Yellow
+        status_symbol = '🔒'  # Lock emoji
+    else:  # Dead
+        color = "\033[91m"  # Red
+        status_symbol = '✕'
+    
     if use_padding:
         name_padding = ' ' * (max_name_length - len(channel_name) + 3)  # +3 for additional spaces
     else:
         name_padding = ''
+    
     if status == 'Alive':
         print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}\033[0m")
         logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}")
-    else:
+    elif 'Geoblocked' in status:
+        geoblock_info = f" [{status}]" if 'Confirmed' in status or 'Unconfirmed' in status else " [Geoblocked]"
         if use_padding:
-            # Include the | for dead links only when padding is added
+            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}\033[0m")
+            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}")
+        else:
+            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}\033[0m")
+            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}")
+    else:  # Dead
+        if use_padding:
             print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |\033[0m")
             logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |")
         else:
             print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout, split=False, rename=False):
+def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout, split=False, rename=False, proxy_list=None, test_geoblock=False):
     base_playlist_name = os.path.basename(file_path).split('.')[0]
     group_name = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
     output_folder = f"{base_playlist_name}_{group_name}_screenshots"
@@ -271,6 +380,7 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
 
     working_channels = []
     dead_channels = []
+    geoblocked_channels = []
 
     # Get console width
     console_width = shutil.get_terminal_size((80, 20)).columns
@@ -307,7 +417,7 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                         identifier = f"{channel_name} {next_line}"
                         if identifier not in processed_channels:
                             current_channel += 1
-                            status = check_channel_status(next_line, timeout, extended_timeout=extended_timeout)
+                            status = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
                             video_info = "Unknown"
                             audio_info = "Unknown"
                             fps = None
@@ -332,6 +442,9 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
 
                                 if split:
                                     working_channels.append((line, next_line))
+                            elif 'Geoblocked' in status:
+                                if split:
+                                    geoblocked_channels.append((line, next_line))
                             else:
                                 if split:
                                     dead_channels.append((line, next_line))
@@ -353,16 +466,28 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
             if split:
                 working_playlist_path = f"{base_playlist_name}_working.m3u8"
                 dead_playlist_path = f"{base_playlist_name}_dead.m3u8"
+                geoblocked_playlist_path = f"{base_playlist_name}_geoblocked.m3u8"
+                
                 with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
                     working_file.write("#EXTM3U\n")
                     for entry in working_channels:
                         working_file.write(entry[0] + "\n")
                         working_file.write(entry[1] + "\n")
+                        
                 with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
                     dead_file.write("#EXTM3U\n")
                     for entry in dead_channels:
                         dead_file.write(entry[0] + "\n")
                         dead_file.write(entry[1] + "\n")
+                        
+                if geoblocked_channels:
+                    with open(geoblocked_playlist_path, 'w', encoding='utf-8') as geoblocked_file:
+                        geoblocked_file.write("#EXTM3U\n")
+                        for entry in geoblocked_channels:
+                            geoblocked_file.write(entry[0] + "\n")
+                            geoblocked_file.write(entry[1] + "\n")
+                    logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
+                    
                 logging.info(f"Working channels playlist saved to {working_playlist_path}")
                 logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
             elif rename:  # Save the renamed playlist directly if split is not enabled
@@ -388,12 +513,16 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                 logging.info("Mislabeled Channels Detected:")
                 for entry in mislabeled_channels:
                     logging.info(entry)
+                    
+            # Summary of geoblocked channels
+            if geoblocked_channels:
+                print(f"\n\033[93mGeoblocked Channels Summary: {len(geoblocked_channels)} channels detected\033[0m")
+                logging.info(f"Geoblocked Channels Summary: {len(geoblocked_channels)} channels detected")
 
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}. Please check the path and try again.")
     except Exception as e:
         logging.error(f"An unexpected error occurred while processing the file: {str(e)}")
-
 
 def main():
     print_header()
@@ -406,6 +535,8 @@ def main():
     parser.add_argument("-extended", "-e", type=int, nargs='?', const=10, default=None, help="Enable extended timeout check for dead channels. Default is 10 seconds if used without specifying time.")
     parser.add_argument("-split", "-s", action="store_true", help="Create separate playlists for working and dead channels")
     parser.add_argument("-rename", "-r", action="store_true", help="Rename alive channels to include video and audio info")
+    parser.add_argument("-proxy-list", "-p", type=str, default=None, help="Path to proxy list file for geoblock testing")
+    parser.add_argument("-test-geoblock", "-tg", action="store_true", help="Test geoblocked streams with proxies to confirm geoblocking")
 
     args = parser.parse_args()
 
@@ -419,8 +550,20 @@ def main():
 
     group_name = args.group.replace('|', '').replace(' ', '') if args.group else 'AllGroups'
     log_file_name = f"{os.path.basename(args.playlist).split('.')[0]}_{group_name}_checklog.txt"
+    
+    # Load proxy list if provided
+    proxy_list = None
+    if args.proxy_list:
+        proxy_list = load_proxy_list(args.proxy_list)
+        if proxy_list:
+            logging.info(f"Loaded {len(proxy_list)} proxies from {args.proxy_list}")
+        else:
+            logging.warning(f"No valid proxies loaded from {args.proxy_list}")
+            if args.test_geoblock:
+                logging.error("Cannot test geoblocks without valid proxies. Disabling geoblock testing.")
+                args.test_geoblock = False
 
-    parse_m3u8_file(args.playlist, args.group, args.timeout, log_file_name, extended_timeout=args.extended, split=args.split, rename=args.rename)
+    parse_m3u8_file(args.playlist, args.group, args.timeout, log_file_name, extended_timeout=args.extended, split=args.split, rename=args.rename, proxy_list=proxy_list, test_geoblock=args.test_geoblock)
 
 if __name__ == "__main__":
     main()
