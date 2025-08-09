@@ -69,7 +69,7 @@ def load_proxy_list(proxy_file):
     Load proxy list from file. Supports formats:
     - ip:port
     - protocol://ip:port
-    - JSON format with proxy objects
+    - JSON format with proxy objects (supports both 'protocol' and 'protocols' fields)
     """
     proxies = []
     try:
@@ -82,11 +82,21 @@ def load_proxy_list(proxy_file):
                 if isinstance(proxy_data, list):
                     for proxy in proxy_data:
                         if isinstance(proxy, dict):
-                            protocol = proxy.get('protocol', 'http')
                             ip = proxy.get('ip')
                             port = proxy.get('port')
+                            
                             if ip and port:
-                                proxies.append(f"{protocol}://{ip}:{port}")
+                                # Check for protocols array (new format)
+                                if 'protocols' in proxy and isinstance(proxy['protocols'], list):
+                                    for protocol in proxy['protocols']:
+                                        proxies.append(f"{protocol}://{ip}:{port}")
+                                # Fall back to single protocol (legacy format)
+                                elif 'protocol' in proxy:
+                                    protocol = proxy.get('protocol', 'http')
+                                    proxies.append(f"{protocol}://{ip}:{port}")
+                                # Default to http if no protocol specified
+                                else:
+                                    proxies.append(f"http://{ip}:{port}")
                         elif isinstance(proxy, str):
                             proxies.append(proxy)
                 return proxies
