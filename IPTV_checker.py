@@ -38,6 +38,33 @@ def handle_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, handle_sigint)
 
+def check_ffmpeg_availability():
+    """Check if ffmpeg and ffprobe are available in the system PATH"""
+    tools_available = True
+    
+    for tool in ['ffmpeg', 'ffprobe']:
+        try:
+            result = subprocess.run([tool, '-version'], 
+                                  stdout=subprocess.PIPE, 
+                                  stderr=subprocess.PIPE, 
+                                  timeout=5)
+            if result.returncode == 0:
+                logging.debug(f"{tool} is available")
+            else:
+                logging.error(f"{tool} is installed but not working properly")
+                tools_available = False
+        except FileNotFoundError:
+            logging.error(f"{tool} is not found in system PATH. Please install {tool} to use this tool.")
+            tools_available = False
+        except subprocess.TimeoutExpired:
+            logging.error(f"{tool} check timed out")
+            tools_available = False
+        except Exception as e:
+            logging.error(f"Error checking {tool}: {str(e)}")
+            tools_available = False
+    
+    return tools_available
+
 def test_with_proxy(url, proxy, timeout, retries=3):
     """
     Test stream access through a specific proxy
@@ -214,8 +241,14 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             if ffmpeg_result.returncode != 0:
                 logging.debug(f"ffmpeg failed to read stream; marking as dead")
                 status = 'Dead'
+        except FileNotFoundError:
+            logging.warning(f"ffmpeg not found for stream verification, skipping ffmpeg check")
+            # Keep status as 'Alive' since we already verified via HTTP
         except subprocess.TimeoutExpired:
             logging.error(f"Timeout when trying to verify stream with ffmpeg for {url}")
+            status = 'Dead'
+        except Exception as e:
+            logging.error(f"Error verifying stream with ffmpeg: {str(e)}")
             status = 'Dead'
 
     return status
@@ -229,8 +262,14 @@ def capture_frame(url, output_path, file_name):
         subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         logging.debug(f"Screenshot saved for {file_name}")
         return True
+    except FileNotFoundError:
+        logging.error(f"ffmpeg not found. Please install ffmpeg to capture screenshots.")
+        return False
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout when trying to capture frame for {file_name}")
+        return False
+    except Exception as e:
+        logging.error(f"Error capturing frame for {file_name}: {str(e)}")
         return False
 
 def get_stream_info(url):
@@ -272,8 +311,14 @@ def get_stream_info(url):
         resolution_fps = f"{resolution}{fps}" if resolution != "Unknown" and fps else resolution
 
         return f"{resolution_fps} {codec_name}" if codec_name and resolution_fps else "Unknown", resolution, fps
+    except FileNotFoundError:
+        logging.error(f"ffprobe not found. Please install ffprobe to get stream info.")
+        return "Unknown", "Unknown", None
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout when trying to get stream info for {url}")
+        return "Unknown", "Unknown", None
+    except Exception as e:
+        logging.error(f"Error getting stream info: {str(e)}")
         return "Unknown", "Unknown", None
 
 def get_audio_bitrate(url):
@@ -297,8 +342,14 @@ def get_audio_bitrate(url):
                 codec_name = line.split('=')[1].upper()
 
         return f"{audio_bitrate} kbps {codec_name}" if codec_name and audio_bitrate else "Unknown"
+    except FileNotFoundError:
+        logging.error(f"ffprobe not found. Please install ffprobe to get audio bitrate.")
+        return "Unknown"
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout when trying to get audio bitrate for {url}")
+        return "Unknown"
+    except Exception as e:
+        logging.error(f"Error getting audio bitrate: {str(e)}")
         return "Unknown"
 
 def check_label_mismatch(channel_name, resolution):
@@ -379,7 +430,16 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
     base_playlist_name = os.path.basename(file_path).split('.')[0]
     group_name = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
     output_folder = f"{base_playlist_name}_{group_name}_screenshots"
-    os.makedirs(output_folder, exist_ok=True)
+    
+    # Create output folder with better error handling
+    try:
+        os.makedirs(output_folder, exist_ok=True)
+    except PermissionError:
+        logging.error(f"Permission denied: Cannot create output folder '{output_folder}'")
+        return
+    except Exception as e:
+        logging.error(f"Failed to create output folder '{output_folder}': {str(e)}")
+        return
 
     processed_channels, last_index = load_processed_channels(log_file)
     current_channel = last_index
@@ -395,9 +455,23 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
     # Get console width
     console_width = shutil.get_terminal_size((80, 20)).columns
 
+    # Open and read the M3U file with specific error handling
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
             lines = file.readlines()
+    except FileNotFoundError:
+        logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
+        return
+    except PermissionError:
+        logging.error(f"Permission denied: Cannot read M3U file '{file_path}'")
+        return
+    except Exception as e:
+        logging.error(f"Failed to read M3U file '{file_path}': {str(e)}")
+        return
+
+    try:
+        # Process the lines that were successfully read
+        lines = lines  # lines already read above
             total_channels = sum(1 for line in lines if line.startswith('#EXTINF') and (group_title in line if group_title else True))
 
             logging.info(f"Loading channels from {file_path} with group '{group_title}'...")
@@ -529,10 +603,10 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                 print(f"\n\033[93mGeoblocked Channels Summary: {len(geoblocked_channels)} channels detected\033[0m")
                 logging.info(f"Geoblocked Channels Summary: {len(geoblocked_channels)} channels detected")
 
-    except FileNotFoundError:
-        logging.error(f"File not found: {file_path}. Please check the path and try again.")
     except Exception as e:
-        logging.error(f"An unexpected error occurred while processing the file: {str(e)}")
+        logging.error(f"An unexpected error occurred while processing channels: {str(e)}")
+        import traceback
+        logging.debug(f"Traceback: {traceback.format_exc()}")
 
 def main():
     print_header()
@@ -557,6 +631,11 @@ def main():
         logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     else:
         logging.basicConfig(level=logging.CRITICAL)  # Only critical errors will be logged by default.
+
+    # Check for ffmpeg and ffprobe availability
+    if not check_ffmpeg_availability():
+        logging.warning("ffmpeg and/or ffprobe not found. Some features will be disabled.")
+        print("\033[93mWarning: ffmpeg and/or ffprobe not found. Screenshot capture and media info detection will be disabled.\033[0m")
 
     group_name = args.group.replace('|', '').replace(' ', '') if args.group else 'AllGroups'
     log_file_name = f"{os.path.basename(args.playlist).split('.')[0]}_{group_name}_checklog.txt"
