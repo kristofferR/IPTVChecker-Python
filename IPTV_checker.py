@@ -471,137 +471,136 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
 
     try:
         # Process the lines that were successfully read
-        lines = lines  # lines already read above
-            total_channels = sum(1 for line in lines if line.startswith('#EXTINF') and (group_title in line if group_title else True))
+        total_channels = sum(1 for line in lines if line.startswith('#EXTINF') and (group_title in line if group_title else True))
 
-            logging.info(f"Loading channels from {file_path} with group '{group_title}'...")
-            logging.info(f"Total channels matching group '{group_title}': {total_channels}\n")
+        logging.info(f"Loading channels from {file_path} with group '{group_title}'...")
+        logging.info(f"Total channels matching group '{group_title}': {total_channels}\n")
 
-            # Calculate the maximum channel name length and check if the formatted line will fit in the console width
-            for i in range(len(lines)):
-                line = lines[i].strip()
-                if line.startswith('#EXTINF') and (group_title in line if group_title else True):
-                    if i + 1 < len(lines):
-                        channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
-                        max_name_length = max(max_name_length, len(channel_name))
+        # Calculate the maximum channel name length and check if the formatted line will fit in the console width
+        for i in range(len(lines)):
+            line = lines[i].strip()
+            if line.startswith('#EXTINF') and (group_title in line if group_title else True):
+                if i + 1 < len(lines):
+                    channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
+                    max_name_length = max(max_name_length, len(channel_name))
 
-            # Estimate if the line will fit in the console width
-            max_line_length = max_name_length + len("1/5 ✓ | Video: 1080p50 H264 - Audio: 160 kbps AAC") + 3  # 3 for extra padding
-            if max_line_length > console_width:
-                use_padding = False
+        # Estimate if the line will fit in the console width
+        max_line_length = max_name_length + len("1/5 ✓ | Video: 1080p50 H264 - Audio: 160 kbps AAC") + 3  # 3 for extra padding
+        if max_line_length > console_width:
+            use_padding = False
 
-            renamed_lines = []
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if line.startswith('#EXTINF') and (group_title in line if group_title else True):
-                    if i + 1 < len(lines):
-                        next_line = lines[i + 1].strip()
-                        channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
-                        identifier = f"{channel_name} {next_line}"
-                        if identifier not in processed_channels:
-                            current_channel += 1
-                            status = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
-                            video_info = "Unknown"
-                            audio_info = "Unknown"
-                            fps = None
-                            if status == 'Alive':
-                                video_info, resolution, fps = get_stream_info(next_line)
-                                audio_info = get_audio_bitrate(next_line)
-                                mismatches = check_label_mismatch(channel_name, resolution)
-                                if fps is not None and fps <= 30:
-                                    low_framerate_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
-                                if mismatches:
-                                    mislabeled_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{', '.join(mismatches)}\033[0m")
-                                file_name = f"{current_channel}-{channel_name.replace('/', '-')}"  # Replace '/' to avoid path issues
-                                capture_frame(next_line, output_folder, file_name)
-                                
-                                if rename:
-                                    # Create the new channel name in the desired format
-                                    renamed_channel_name = f"{channel_name} ({resolution} {video_info.split()[-1]} | {audio_info})"
-                                    extinf_parts = line.split(',', 1)
-                                    if len(extinf_parts) > 1:
-                                        extinf_parts[1] = renamed_channel_name
-                                        line = ','.join(extinf_parts)
+        renamed_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('#EXTINF') and (group_title in line if group_title else True):
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
+                    identifier = f"{channel_name} {next_line}"
+                    if identifier not in processed_channels:
+                        current_channel += 1
+                        status = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
+                        video_info = "Unknown"
+                        audio_info = "Unknown"
+                        fps = None
+                        if status == 'Alive':
+                            video_info, resolution, fps = get_stream_info(next_line)
+                            audio_info = get_audio_bitrate(next_line)
+                            mismatches = check_label_mismatch(channel_name, resolution)
+                            if fps is not None and fps <= 30:
+                                low_framerate_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
+                            if mismatches:
+                                mislabeled_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{', '.join(mismatches)}\033[0m")
+                            file_name = f"{current_channel}-{channel_name.replace('/', '-')}"  # Replace '/' to avoid path issues
+                            capture_frame(next_line, output_folder, file_name)
+                            
+                            if rename:
+                                # Create the new channel name in the desired format
+                                renamed_channel_name = f"{channel_name} ({resolution} {video_info.split()[-1]} | {audio_info})"
+                                extinf_parts = line.split(',', 1)
+                                if len(extinf_parts) > 1:
+                                    extinf_parts[1] = renamed_channel_name
+                                    line = ','.join(extinf_parts)
 
-                                if split:
-                                    working_channels.append((line, next_line))
-                            elif 'Geoblocked' in status:
-                                if split:
-                                    geoblocked_channels.append((line, next_line))
-                            else:
-                                if split:
-                                    dead_channels.append((line, next_line))
-                            console_log_entry(current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
-                            processed_channels.add(identifier)
+                            if split:
+                                working_channels.append((line, next_line))
+                        elif 'Geoblocked' in status:
+                            if split:
+                                geoblocked_channels.append((line, next_line))
+                        else:
+                            if split:
+                                dead_channels.append((line, next_line))
+                        console_log_entry(current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
+                        processed_channels.add(identifier)
 
-                        # Add the processed (renamed) line and the corresponding URL to the list
-                        renamed_lines.append(line)
-                        renamed_lines.append(next_line)
-                        i += 1  # Skip the next line because it's already processed
-                    else:
-                        # If there's no URL following the EXTINF line, just add it
-                        renamed_lines.append(line)
-                else:
-                    # If it's not an EXTINF line, just keep it as is
+                    # Add the processed (renamed) line and the corresponding URL to the list
                     renamed_lines.append(line)
-                i += 1
+                    renamed_lines.append(next_line)
+                    i += 1  # Skip the next line because it's already processed
+                else:
+                    # If there's no URL following the EXTINF line, just add it
+                    renamed_lines.append(line)
+            else:
+                # If it's not an EXTINF line, just keep it as is
+                renamed_lines.append(line)
+            i += 1
 
-            if split:
-                working_playlist_path = f"{base_playlist_name}_working.m3u8"
-                dead_playlist_path = f"{base_playlist_name}_dead.m3u8"
-                geoblocked_playlist_path = f"{base_playlist_name}_geoblocked.m3u8"
-                
-                with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
-                    working_file.write("#EXTM3U\n")
-                    for entry in working_channels:
-                        working_file.write(entry[0] + "\n")
-                        working_file.write(entry[1] + "\n")
-                        
-                with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
-                    dead_file.write("#EXTM3U\n")
-                    for entry in dead_channels:
-                        dead_file.write(entry[0] + "\n")
-                        dead_file.write(entry[1] + "\n")
-                        
-                if geoblocked_channels:
-                    with open(geoblocked_playlist_path, 'w', encoding='utf-8') as geoblocked_file:
-                        geoblocked_file.write("#EXTM3U\n")
-                        for entry in geoblocked_channels:
-                            geoblocked_file.write(entry[0] + "\n")
-                            geoblocked_file.write(entry[1] + "\n")
-                    logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
+        if split:
+            working_playlist_path = f"{base_playlist_name}_working.m3u8"
+            dead_playlist_path = f"{base_playlist_name}_dead.m3u8"
+            geoblocked_playlist_path = f"{base_playlist_name}_geoblocked.m3u8"
+            
+            with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
+                working_file.write("#EXTM3U\n")
+                for entry in working_channels:
+                    working_file.write(entry[0] + "\n")
+                    working_file.write(entry[1] + "\n")
                     
-                logging.info(f"Working channels playlist saved to {working_playlist_path}")
-                logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
-            elif rename:  # Save the renamed playlist directly if split is not enabled
-                renamed_playlist_path = f"{base_playlist_name}_renamed.m3u8"
-                with open(renamed_playlist_path, 'w', encoding='utf-8') as renamed_file:
-                    renamed_file.write("#EXTM3U\n")
-                    for line in renamed_lines:
-                        renamed_file.write(line + "\n")
-                logging.info(f"Renamed playlist saved to {renamed_playlist_path}")
-
-            if low_framerate_channels:
-                print("\n\033[93mLow Framerate Channels:\033[0m")
-                for entry in low_framerate_channels:
-                    print(f"{entry}")
-                logging.info("Low Framerate Channels Detected:")
-                for entry in low_framerate_channels:
-                    logging.info(entry)
-
-            if mislabeled_channels:
-                print("\n\033[93mMislabeled Channels:\033[0m")
-                for entry in mislabeled_channels:
-                    print(f"{entry}")
-                logging.info("Mislabeled Channels Detected:")
-                for entry in mislabeled_channels:
-                    logging.info(entry)
+            with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
+                dead_file.write("#EXTM3U\n")
+                for entry in dead_channels:
+                    dead_file.write(entry[0] + "\n")
+                    dead_file.write(entry[1] + "\n")
                     
-            # Summary of geoblocked channels
             if geoblocked_channels:
-                print(f"\n\033[93mGeoblocked Channels Summary: {len(geoblocked_channels)} channels detected\033[0m")
-                logging.info(f"Geoblocked Channels Summary: {len(geoblocked_channels)} channels detected")
+                with open(geoblocked_playlist_path, 'w', encoding='utf-8') as geoblocked_file:
+                    geoblocked_file.write("#EXTM3U\n")
+                    for entry in geoblocked_channels:
+                        geoblocked_file.write(entry[0] + "\n")
+                        geoblocked_file.write(entry[1] + "\n")
+                logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
+                
+            logging.info(f"Working channels playlist saved to {working_playlist_path}")
+            logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
+        elif rename:  # Save the renamed playlist directly if split is not enabled
+            renamed_playlist_path = f"{base_playlist_name}_renamed.m3u8"
+            with open(renamed_playlist_path, 'w', encoding='utf-8') as renamed_file:
+                renamed_file.write("#EXTM3U\n")
+                for line in renamed_lines:
+                    renamed_file.write(line + "\n")
+            logging.info(f"Renamed playlist saved to {renamed_playlist_path}")
+
+        if low_framerate_channels:
+            print("\n\033[93mLow Framerate Channels:\033[0m")
+            for entry in low_framerate_channels:
+                print(f"{entry}")
+            logging.info("Low Framerate Channels Detected:")
+            for entry in low_framerate_channels:
+                logging.info(entry)
+
+        if mislabeled_channels:
+            print("\n\033[93mMislabeled Channels:\033[0m")
+            for entry in mislabeled_channels:
+                print(f"{entry}")
+            logging.info("Mislabeled Channels Detected:")
+            for entry in mislabeled_channels:
+                logging.info(entry)
+                
+        # Summary of geoblocked channels
+        if geoblocked_channels:
+            print(f"\n\033[93mGeoblocked Channels Summary: {len(geoblocked_channels)} channels detected\033[0m")
+            logging.info(f"Geoblocked Channels Summary: {len(geoblocked_channels)} channels detected")
 
     except Exception as e:
         logging.error(f"An unexpected error occurred while processing channels: {str(e)}")
