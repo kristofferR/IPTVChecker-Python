@@ -17,9 +17,13 @@ IPTV Stream Checker is a command-line tool designed to check the status of chann
 - **Detailed Stream Info:** Retrieve and display video codec, resolution, framerate, and audio bitrate.
 - **Low Framerate Detection:** Identifies and lists channels with framerates at 30fps or below.
 - **Mislabeled Channel Detection:** Detects channels with resolutions that do not match their labels (e.g., "1080p" labeled as "4K").
+- **Average Video Bitrate (optional):** When enabled, profiles each alive stream for 10 seconds with ffmpeg to estimate the average video bitrate.
+- **Regex Channel Filter:** Filter channels with a case-insensitive regular expression, even across multiple playlists.
+- **CSV Reporting:** Export per-channel results (status, metadata, bitrate, audio) to a CSV file.
+- **Directory Support:** Point the tool at a directory to scan every M3U/M3U8 file it contains.
 - **Geoblock Detection:** Automatically detects geoblocked streams using HTTP status codes (403, 451, etc.).
 - **Proxy Testing:** Tests geoblocked streams through proxy servers to confirm geographic restrictions.
-- **Custom User-Agent:** Uses `IPTVChecker 1.0` as the user agent for HTTP requests.
+- **Custom User-Agent:** Uses `VLC/3.0.14 LibVLC/3.0.14` as the user agent for HTTP requests to improve stream compatibility.
 
 ## Installation
 
@@ -59,6 +63,10 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
 - **`-rename` or `-r`**: Rename alive channels to include video and audio information in the playlist.
 - **`-proxy-list` or `-p`**: Path to proxy list file for geoblock testing.
 - **`-test-geoblock` or `-tg`**: Test geoblocked streams with proxies to confirm geoblocking.
+- **`-output` or `-o`**: Write a CSV summary with channel status, codec details, and bitrate.
+- **`-channel_search` or `-c`**: Only process channels whose names match a case-insensitive regular expression.
+- **`-skip_screenshots`**: Skip capturing screenshots for alive channels to speed up runs.
+- **`--profile-bitrate` or `-b`**: Profile average video bitrate with ffmpeg (adds roughly 10 seconds per channel).
 - **`-v`**: Increase output verbosity to `INFO` level.
 - **`-vv`**: Increase output verbosity to `DEBUG` level.
 
@@ -108,15 +116,31 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
    ```bash
    python IPTV_checker.py /path/to/your/playlist.m3u8 -split -proxy-list proxies.txt -test-geoblock
    ```
+10. **Filter Channels by Name with Regex**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 -c "Sky Sports|TNT Sports"
+    ```
+11. **Process All Playlists in a Directory and Write CSV Output**:
+    ```bash
+    python IPTV_checker.py /path/to/playlists/ -o ~/reports/iptv_results.csv
+    ```
+12. **Skip Screenshots to Speed Up Metadata Collection**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 -skip_screenshots
+    ```
+13. **Enable Average Bitrate Profiling When Needed**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 -b
+    ```
    
 ### Output Format
 
 The script will output the status of each channel in the following format:
 
 ```bash
-1/5 ✓ Channel Name | Video: 1080p60 H264 - Audio: 159 kbps AAC
-2/5 🔒 Geoblocked Channel | [Geoblocked (Confirmed)]
-3/5 ✕ Dead Channel |
+MyPlaylist.m3u| 1/5 ✓ Channel Name | Video: 1080p60 H264 (5200 kbps) - Audio: 159 kbps AAC
+MyPlaylist.m3u| 2/5 🔒 Geoblocked Channel | [Geoblocked (Confirmed)]
+MyPlaylist.m3u| 3/5 ✕ Dead Channel |
 ```
 
 ### Low Framerate Channels
@@ -142,7 +166,9 @@ Mislabeled Channels:
 The script detects and reports geoblocked channels:
 
 ```bash
-Geoblocked Channels Summary: 12 channels detected
+Geoblocked Channels Summary:
+MyPlaylist.m3u: 5 channels detected
+Sports.m3u: 2 channels detected
 ```
 
 When proxy testing is enabled, the tool will attempt to confirm geoblocks by testing through proxy servers.

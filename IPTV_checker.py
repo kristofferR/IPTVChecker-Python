@@ -9,6 +9,8 @@ import logging
 import shutil
 import random
 import json
+import codecs
+import re
 from urllib.parse import urljoin
 
 def print_header():
@@ -38,6 +40,56 @@ def handle_sigint(signum, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGINT, handle_sigint)
+
+def get_video_bitrate(url):
+    """
+    Measure approximate video bitrate by sampling the stream for 10 seconds.
+    """
+    command = [
+        'ffmpeg',
+        '-v',
+        'debug',
+        '-user_agent',
+        'VLC/3.0.14',
+        '-i',
+        url,
+        '-t',
+        '10',
+        '-f',
+        'null',
+        '-'
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20
+        )
+        output = result.stderr.decode(errors='ignore')
+        total_bytes = 0
+        for line in output.splitlines():
+            if "Statistics:" in line and "bytes read" in line:
+                parts = line.split("bytes read")
+                try:
+                    size_str = parts[0].strip().split()[-1]
+                    total_bytes = int(size_str)
+                    break
+                except (IndexError, ValueError):
+                    continue
+        if total_bytes <= 0:
+            return "N/A"
+        bitrate_kbps = (total_bytes * 8) / 1000 / 10
+        return f"{round(bitrate_kbps)} kbps"
+    except FileNotFoundError:
+        logging.warning("ffmpeg not found when attempting to measure video bitrate.")
+        return "Unknown"
+    except subprocess.TimeoutExpired:
+        logging.error(f"Timeout when trying to get video bitrate for {url}")
+        return "Unknown"
+    except Exception as exc:
+        logging.error(f"Error when attempting to retrieve video bitrate: {exc}")
+        return "N/A"
 
 def check_ffmpeg_availability():
     """Check if ffmpeg and ffprobe are available in the system PATH"""
@@ -71,7 +123,7 @@ def test_with_proxy(url, proxy, timeout, retries=3):
     Test stream access through a specific proxy
     """
     headers = {
-        'User-Agent': 'IPTVChecker 1.0'
+        'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
     
     try:
@@ -150,7 +202,7 @@ def load_proxy_list(proxy_file):
 
 def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False):
     headers = {
-        'User-Agent': 'IPTVChecker 1.0'
+        'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
     min_data_threshold = 1024 * 500  # 500KB minimum threshold for direct streams
     playlist_segment_threshold = 1024 * 128  # Smaller threshold for HLS media segments
@@ -346,7 +398,7 @@ def capture_frame(url, output_path, file_name):
         logging.error(f"Error capturing frame for {file_name}: {str(e)}")
         return False
 
-def get_stream_info(url):
+def get_detailed_stream_info(url, profile_bitrate=False):
     command = [
         'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 
         'stream=codec_name,width,height,r_frame_rate', '-of', 'default=noprint_wrappers=1', url
@@ -382,18 +434,35 @@ def get_stream_info(url):
             else:
                 resolution = "SD"
 
-        resolution_fps = f"{resolution}{fps}" if resolution != "Unknown" and fps else resolution
+        video_bitrate = get_video_bitrate(url) if profile_bitrate else "N/A"
 
-        return f"{resolution_fps} {codec_name}" if codec_name and resolution_fps else "Unknown", resolution, fps
+        return codec_name or "Unknown", video_bitrate, resolution, fps
     except FileNotFoundError:
         logging.error(f"ffprobe not found. Please install ffprobe to get stream info.")
-        return "Unknown", "Unknown", None
+        return "Unknown", "Unknown", "Unknown", None
     except subprocess.TimeoutExpired:
         logging.error(f"Timeout when trying to get stream info for {url}")
-        return "Unknown", "Unknown", None
+        return "Unknown", "Unknown", "Unknown", None
     except Exception as e:
         logging.error(f"Error getting stream info: {str(e)}")
-        return "Unknown", "Unknown", None
+        return "Unknown", "Unknown", "Unknown", None
+
+def format_stream_info(codec_name, video_bitrate, resolution, fps):
+    if resolution != "Unknown" and fps:
+        resolution_display = f"{resolution}{fps}"
+    else:
+        resolution_display = resolution
+
+    components = []
+    if resolution_display != "Unknown":
+        components.append(resolution_display)
+    if codec_name and codec_name != "Unknown":
+        components.append(codec_name)
+
+    base_info = " ".join(components) if components else "Unknown"
+    if video_bitrate and isinstance(video_bitrate, str) and video_bitrate not in ("Unknown", "N/A"):
+        return f"{base_info} ({video_bitrate})"
+    return base_info
 
 def get_audio_bitrate(url):
     command = [
@@ -446,6 +515,39 @@ def check_label_mismatch(channel_name, resolution):
 
     return mismatches
 
+def get_channel_name(extinf_line):
+    if extinf_line.startswith('#EXTINF') and ',' in extinf_line:
+        return extinf_line.split(',', 1)[1].strip()
+    return "Unknown Channel"
+
+def get_group_name(extinf_line):
+    if "group-title=" in extinf_line:
+        segment = extinf_line.split("group-title=", 1)[1]
+        segment = segment.replace("\"", "")
+        if "," in segment:
+            return segment.split(",", 1)[0]
+        return segment
+    return "Unknown Group"
+
+def get_channel_id(url):
+    if not url:
+        return "Unknown"
+    segment = url.rsplit('/', 1)[-1]
+    if segment:
+        return segment.replace('.ts', '')
+    return "Unknown"
+
+def is_line_needed(line, group_title, pattern):
+    if not line.startswith('#EXTINF'):
+        return False
+    if group_title and group_title not in line:
+        return False
+    if pattern:
+        channel_name = get_channel_name(line)
+        if not pattern.search(channel_name):
+            return False
+    return True
+
 def load_processed_channels(log_file):
     processed_channels = set()
     last_index = 0
@@ -464,7 +566,23 @@ def write_log_entry(log_file, entry):
     with open(log_file, 'a') as f:
         f.write(entry + "\n")
 
-def console_log_entry(current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding):
+def file_log_entry(f_output, playlist_file, current_channel, total_channels, group_name, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info):
+    if f_output is None:
+        return
+    safe_group = group_name.replace('"', '""') if group_name else ""
+    safe_channel = channel_name.replace('"', '""') if channel_name else ""
+    codec_field = codec_name if codec_name else "Unknown"
+    bitrate_field = video_bitrate.replace("kbps", "").strip() if isinstance(video_bitrate, str) else video_bitrate
+    if not bitrate_field:
+        bitrate_field = "Unknown"
+    fps_field = fps if fps is not None else ""
+    audio_field = audio_info.replace('"', '""') if audio_info else "Unknown"
+    channel_id_field = channel_id if channel_id else "Unknown"
+    f_output.write(
+        f"{playlist_file},{current_channel},{total_channels},{status},\"{safe_group}\",\"{safe_channel}\",{channel_id_field},{codec_field},{bitrate_field},{resolution},{fps_field},{audio_field}\n"
+    )
+
+def console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding):
     # Set colors and symbols based on status
     if status == 'Alive':
         color = "\033[92m"  # Green
@@ -482,117 +600,142 @@ def console_log_entry(current_channel, total_channels, channel_name, status, vid
         name_padding = ''
     
     if status == 'Alive':
-        print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}\033[0m")
-        logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}")
+        prefix = f"{playlist_file}| " if playlist_file else ""
+        print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}\033[0m")
+        logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} | Video: {video_info} - Audio: {audio_info}")
     elif 'Geoblocked' in status:
         geoblock_info = f" [{status}]" if 'Confirmed' in status or 'Unconfirmed' in status else " [Geoblocked]"
         if use_padding:
-            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}\033[0m")
-            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}")
+            prefix = f"{playlist_file}| " if playlist_file else ""
+            print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}\033[0m")
+            logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |{geoblock_info}")
         else:
-            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}\033[0m")
-            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}")
+            prefix = f"{playlist_file}| " if playlist_file else ""
+            print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}\033[0m")
+            logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{geoblock_info}")
     else:  # Dead
         if use_padding:
-            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |\033[0m")
-            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |")
+            prefix = f"{playlist_file}| " if playlist_file else ""
+            print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |\033[0m")
+            logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}{name_padding} |")
         else:
-            print(f"{color}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
-            logging.info(f"{current_channel}/{total_channels} {status_symbol} {channel_name}")
+            prefix = f"{playlist_file}| " if playlist_file else ""
+            print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
+            logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout, split=False, rename=False, proxy_list=None, test_geoblock=False):
-    base_playlist_name = os.path.basename(file_path).split('.')[0]
-    group_name = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
-    output_folder = f"{base_playlist_name}_{group_name}_screenshots"
-    
-    # Create output folder with better error handling
-    try:
-        os.makedirs(output_folder, exist_ok=True)
-    except PermissionError:
-        logging.error(f"Permission denied: Cannot create output folder '{output_folder}'")
-        return
-    except Exception as e:
-        logging.error(f"Failed to create output folder '{output_folder}': {str(e)}")
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, proxy_list=None, test_geoblock=False, profile_bitrate=False):
+    if not playlists:
+        logging.error("No playlists to process.")
         return
 
-    processed_channels, last_index = load_processed_channels(log_file)
-    current_channel = last_index
-    mislabeled_channels = []
-    low_framerate_channels = []
-    max_name_length = 0
-    use_padding = True
-
-    working_channels = []
-    dead_channels = []
-    geoblocked_channels = []
-
-    # Get console width
+    group_suffix = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
+    pattern = re.compile(channel_search, flags=re.IGNORECASE) if channel_search else None
     console_width = shutil.get_terminal_size((80, 20)).columns
 
-    # Open and read the M3U file with specific error handling
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            lines = file.readlines()
-    except FileNotFoundError:
-        logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
-        return
-    except PermissionError:
-        logging.error(f"Permission denied: Cannot read M3U file '{file_path}'")
-        return
-    except Exception as e:
-        logging.error(f"Failed to read M3U file '{file_path}': {str(e)}")
-        return
+    low_framerate_channels = []
+    mislabeled_channels = []
+    geoblocked_summary = {}
 
-    try:
-        # Process the lines that were successfully read
-        total_channels = sum(1 for line in lines if line.startswith('#EXTINF') and (group_title in line if group_title else True))
+    f_output = None
+    if output_file:
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as exc:
+                logging.error(f"Failed to create output directory '{output_dir}': {exc}")
+                output_file = None
+        if output_file:
+            try:
+                f_output = codecs.open(output_file, "w", "utf-8-sig")
+                f_output.write("Playlist,Channel Number,Total Channels in Playlist,Channel Status,Group Name,Channel Name,Channel ID,Codec,Bit Rate (kbps),Resolution,Frame Rate,Audio\n")
+            except OSError as exc:
+                logging.error(f"Unable to open output file '{output_file}': {exc}")
+                f_output = None
 
-        logging.info(f"Loading channels from {file_path} with group '{group_title}'...")
-        logging.info(f"Total channels matching group '{group_title}': {total_channels}\n")
+    for file_path in playlists:
+        playlist_file = os.path.basename(file_path)
+        base_playlist_name = os.path.splitext(playlist_file)[0]
+        logging.info(f"Loading channels from {file_path} with group '{group_title}' and search '{channel_search if channel_search else 'None'}'...")
 
-        # Calculate the maximum channel name length and check if the formatted line will fit in the console width
-        for i in range(len(lines)):
-            line = lines[i].strip()
-            if line.startswith('#EXTINF') and (group_title in line if group_title else True):
-                if i + 1 < len(lines):
-                    channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
-                    max_name_length = max(max_name_length, len(channel_name))
+        output_folder = None
+        if not skip_screenshots:
+            output_folder = f"{base_playlist_name}_{group_suffix}_screenshots"
+            try:
+                os.makedirs(output_folder, exist_ok=True)
+            except Exception as exc:
+                logging.error(f"Failed to create output folder '{output_folder}': {exc}")
+                output_folder = None
 
-        # Estimate if the line will fit in the console width
-        max_line_length = max_name_length + len("1/5 ✓ | Video: 1080p50 H264 - Audio: 160 kbps AAC") + 3  # 3 for extra padding
-        if max_line_length > console_width:
-            use_padding = False
+        log_file = f"{base_playlist_name}_{group_suffix}_checklog.txt"
+        processed_channels, last_index = load_processed_channels(log_file)
+        current_channel = last_index
+        working_channels = []
+        dead_channels = []
+        geoblocked_channels = []
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                lines = [line.strip() for line in file.readlines()]
+        except FileNotFoundError:
+            logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
+            continue
+        except PermissionError:
+            logging.error(f"Permission denied: Cannot read M3U file '{file_path}'")
+            continue
+        except Exception as exc:
+            logging.error(f"Failed to read M3U file '{file_path}': {exc}")
+            continue
+
+        channels = [line for line in lines if is_line_needed(line, group_title, pattern)]
+        total_channels = len(channels)
+        logging.info(f"{playlist_file}: Total channels matching selection: {total_channels}\n")
+
+        max_name_length = 0
+        for channel_line in channels:
+            channel_name = get_channel_name(channel_line)
+            max_name_length = max(max_name_length, len(channel_name))
+
+        max_line_length = max_name_length + len("1/5 ✓ | Video: 1080p50 H264 - Audio: 160 kbps AAC") + 3
+        use_padding = max_line_length <= console_width
 
         renamed_lines = []
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            if line.startswith('#EXTINF') and (group_title in line if group_title else True):
+            if is_line_needed(line, group_title, pattern):
                 if i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
-                    channel_name = line.split(',', 1)[1].strip() if ',' in line else "Unknown Channel"
+                    channel_name = get_channel_name(line)
                     identifier = f"{channel_name} {next_line}"
                     if identifier not in processed_channels:
                         current_channel += 1
                         status, stream_url = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
                         video_info = "Unknown"
                         audio_info = "Unknown"
+                        codec_name = "Unknown"
+                        video_bitrate = "Unknown"
+                        resolution = "Unknown"
                         fps = None
+                        channel_id = get_channel_id(next_line)
+                        group_value = get_group_name(line)
+
                         if status == 'Alive':
                             target_url = stream_url or next_line
-                            video_info, resolution, fps = get_stream_info(target_url)
+                            codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(target_url, profile_bitrate=profile_bitrate)
+                            video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
                             audio_info = get_audio_bitrate(target_url)
                             mismatches = check_label_mismatch(channel_name, resolution)
                             if fps is not None and fps <= 30:
-                                low_framerate_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
+                                low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
                             if mismatches:
-                                mislabeled_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{', '.join(mismatches)}\033[0m")
-                            file_name = f"{current_channel}-{channel_name.replace('/', '-')}"  # Replace '/' to avoid path issues
-                            capture_frame(target_url, output_folder, file_name)
-                            
+                                mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+                            if not skip_screenshots and output_folder:
+                                file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
+                                capture_frame(target_url, output_folder, file_name)
+
                             if rename:
-                                # Create the new channel name in the desired format
-                                renamed_channel_name = f"{channel_name} ({resolution} {video_info.split()[-1]} | {audio_info})"
+                                renamed_channel_name = f"{channel_name} ({video_info} | Audio: {audio_info})"
                                 extinf_parts = line.split(',', 1)
                                 if len(extinf_parts) > 1:
                                     extinf_parts[1] = renamed_channel_name
@@ -601,23 +744,25 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                             if split:
                                 working_channels.append((line, next_line))
                         elif 'Geoblocked' in status:
-                            if split:
-                                geoblocked_channels.append((line, next_line))
+                            geoblocked_channels.append((line, next_line))
+                            geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
                         else:
                             if split:
                                 dead_channels.append((line, next_line))
-                        console_log_entry(current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
-                        processed_channels.add(identifier)
 
-                    # Add the processed (renamed) line and the corresponding URL to the list
+                        console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
+                        processed_channels.add(identifier)
+                        write_log_entry(log_file, f"{current_channel} - {identifier}")
+                        file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
+                    else:
+                        logging.debug(f"Skipping previously processed channel: {channel_name}")
+
                     renamed_lines.append(line)
                     renamed_lines.append(next_line)
-                    i += 1  # Skip the next line because it's already processed
+                    i += 1
                 else:
-                    # If there's no URL following the EXTINF line, just add it
                     renamed_lines.append(line)
             else:
-                # If it's not an EXTINF line, just keep it as is
                 renamed_lines.append(line)
             i += 1
 
@@ -625,19 +770,23 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
             working_playlist_path = f"{base_playlist_name}_working.m3u8"
             dead_playlist_path = f"{base_playlist_name}_dead.m3u8"
             geoblocked_playlist_path = f"{base_playlist_name}_geoblocked.m3u8"
-            
-            with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
-                working_file.write("#EXTM3U\n")
-                for entry in working_channels:
-                    working_file.write(entry[0] + "\n")
-                    working_file.write(entry[1] + "\n")
-                    
-            with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
-                dead_file.write("#EXTM3U\n")
-                for entry in dead_channels:
-                    dead_file.write(entry[0] + "\n")
-                    dead_file.write(entry[1] + "\n")
-                    
+
+            if working_channels:
+                with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
+                    working_file.write("#EXTM3U\n")
+                    for entry in working_channels:
+                        working_file.write(entry[0] + "\n")
+                        working_file.write(entry[1] + "\n")
+                logging.info(f"Working channels playlist saved to {working_playlist_path}")
+
+            if dead_channels:
+                with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
+                    dead_file.write("#EXTM3U\n")
+                    for entry in dead_channels:
+                        dead_file.write(entry[0] + "\n")
+                        dead_file.write(entry[1] + "\n")
+                logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
+
             if geoblocked_channels:
                 with open(geoblocked_playlist_path, 'w', encoding='utf-8') as geoblocked_file:
                     geoblocked_file.write("#EXTM3U\n")
@@ -645,10 +794,7 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                         geoblocked_file.write(entry[0] + "\n")
                         geoblocked_file.write(entry[1] + "\n")
                 logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
-                
-            logging.info(f"Working channels playlist saved to {working_playlist_path}")
-            logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
-        elif rename:  # Save the renamed playlist directly if split is not enabled
+        elif rename:
             renamed_playlist_path = f"{base_playlist_name}_renamed.m3u8"
             with open(renamed_playlist_path, 'w', encoding='utf-8') as renamed_file:
                 renamed_file.write("#EXTM3U\n")
@@ -656,31 +802,30 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                     renamed_file.write(line + "\n")
             logging.info(f"Renamed playlist saved to {renamed_playlist_path}")
 
-        if low_framerate_channels:
-            print("\n\033[93mLow Framerate Channels:\033[0m")
-            for entry in low_framerate_channels:
-                print(f"{entry}")
-            logging.info("Low Framerate Channels Detected:")
-            for entry in low_framerate_channels:
-                logging.info(entry)
+    if f_output:
+        f_output.close()
 
-        if mislabeled_channels:
-            print("\n\033[93mMislabeled Channels:\033[0m")
-            for entry in mislabeled_channels:
-                print(f"{entry}")
-            logging.info("Mislabeled Channels Detected:")
-            for entry in mislabeled_channels:
-                logging.info(entry)
-                
-        # Summary of geoblocked channels
-        if geoblocked_channels:
-            print(f"\n\033[93mGeoblocked Channels Summary: {len(geoblocked_channels)} channels detected\033[0m")
-            logging.info(f"Geoblocked Channels Summary: {len(geoblocked_channels)} channels detected")
+    if low_framerate_channels:
+        print("\n\033[93mLow Framerate Channels:\033[0m")
+        for entry in low_framerate_channels:
+            print(entry)
+        logging.info("Low Framerate Channels Detected:")
+        for entry in low_framerate_channels:
+            logging.info(entry)
 
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while processing channels: {str(e)}")
-        import traceback
-        logging.debug(f"Traceback: {traceback.format_exc()}")
+    if mislabeled_channels:
+        print("\n\033[93mMislabeled Channels:\033[0m")
+        for entry in mislabeled_channels:
+            print(entry)
+        logging.info("Mislabeled Channels Detected:")
+        for entry in mislabeled_channels:
+            logging.info(entry)
+
+    if geoblocked_summary:
+        print("\n\033[93mGeoblocked Channels Summary:\033[0m")
+        for playlist_file, count in geoblocked_summary.items():
+            print(f"{playlist_file}: {count} channels detected")
+            logging.info(f"{playlist_file}: {count} geoblocked channels detected")
 
 def main():
     print_header()
@@ -691,10 +836,14 @@ def main():
     parser.add_argument("-timeout", "-t", type=float, default=10.0, help="Timeout in seconds for checking channel status")
     parser.add_argument("-v", action="count", default=0, help="Increase output verbosity (-v for info, -vv for debug)")
     parser.add_argument("-extended", "-e", type=int, nargs='?', const=10, default=None, help="Enable extended timeout check for dead channels. Default is 10 seconds if used without specifying time.")
-    parser.add_argument("-split", "-s", action="store_true", help="Create separate playlists for working and dead channels")
+    parser.add_argument("-split", "-s", action="store_true", help="Create separate playlists for working, dead, and geoblocked channels")
     parser.add_argument("-rename", "-r", action="store_true", help="Rename alive channels to include video and audio info")
     parser.add_argument("-proxy-list", "-p", type=str, default=None, help="Path to proxy list file for geoblock testing")
     parser.add_argument("-test-geoblock", "-tg", action="store_true", help="Test geoblocked streams with proxies to confirm geoblocking")
+    parser.add_argument("-output", "-o", type=str, default=None, help="Write channel details to CSV at the provided path")
+    parser.add_argument("-channel_search", "-c", type=str, default=None, help="Regex used to filter channels by name (case-insensitive)")
+    parser.add_argument("-skip_screenshots", action="store_true", help="Skip capturing screenshots for alive channels")
+    parser.add_argument("--profile-bitrate", "-b", action="store_true", help="Profile average video bitrate (slower, uses a 10-second ffmpeg sample)")
 
     args = parser.parse_args()
 
@@ -711,22 +860,56 @@ def main():
         logging.warning("ffmpeg and/or ffprobe not found. Some features will be disabled.")
         print("\033[93mWarning: ffmpeg and/or ffprobe not found. Screenshot capture and media info detection will be disabled.\033[0m")
 
-    group_name = args.group.replace('|', '').replace(' ', '') if args.group else 'AllGroups'
-    log_file_name = f"{os.path.basename(args.playlist).split('.')[0]}_{group_name}_checklog.txt"
-    
     # Load proxy list if provided
     proxy_list = None
     if args.proxy_list:
-        proxy_list = load_proxy_list(args.proxy_list)
+        proxy_path = os.path.expanduser(args.proxy_list)
+        proxy_list = load_proxy_list(proxy_path)
         if proxy_list:
-            logging.info(f"Loaded {len(proxy_list)} proxies from {args.proxy_list}")
+            logging.info(f"Loaded {len(proxy_list)} proxies from {proxy_path}")
         else:
-            logging.warning(f"No valid proxies loaded from {args.proxy_list}")
+            logging.warning(f"No valid proxies loaded from {proxy_path}")
             if args.test_geoblock:
                 logging.error("Cannot test geoblocks without valid proxies. Disabling geoblock testing.")
                 args.test_geoblock = False
 
-    parse_m3u8_file(args.playlist, args.group, args.timeout, log_file_name, extended_timeout=args.extended, split=args.split, rename=args.rename, proxy_list=proxy_list, test_geoblock=args.test_geoblock)
+    playlist_input = os.path.expanduser(args.playlist)
+    playlists = []
+    if os.path.isdir(playlist_input):
+        for entry in sorted(os.listdir(playlist_input)):
+            full_path = os.path.join(playlist_input, entry)
+            if os.path.isfile(full_path) and entry.lower().endswith((".m3u", ".m3u8")):
+                playlists.append(full_path)
+    else:
+        if os.path.isfile(playlist_input):
+            playlists.append(playlist_input)
+        else:
+            logging.error(f"Playlist path not found: {playlist_input}")
+            return
+
+    if not playlists:
+        logging.error("No playlist files found to process.")
+        return
+
+    for playlist in playlists:
+        logging.info(f"Will process playlist: {playlist}")
+
+    output_file = os.path.expanduser(args.output) if args.output else None
+
+    parse_m3u8_files(
+        playlists,
+        args.group,
+        args.timeout,
+        extended_timeout=args.extended,
+        split=args.split,
+        rename=args.rename,
+        skip_screenshots=args.skip_screenshots,
+        output_file=output_file,
+        channel_search=args.channel_search,
+        proxy_list=proxy_list,
+        test_geoblock=args.test_geoblock,
+        profile_bitrate=args.profile_bitrate
+    )
 
 if __name__ == "__main__":
     main()
