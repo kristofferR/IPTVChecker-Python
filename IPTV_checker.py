@@ -9,6 +9,7 @@ import logging
 import shutil
 import random
 import json
+from urllib.parse import urljoin
 
 def print_header():
     header_text = """
@@ -151,75 +152,150 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
     headers = {
         'User-Agent': 'IPTVChecker 1.0'
     }
-    min_data_threshold = 1024 * 500  # 500KB minimum threshold
+    min_data_threshold = 1024 * 500  # 500KB minimum threshold for direct streams
+    playlist_segment_threshold = 1024 * 128  # Smaller threshold for HLS media segments
+    max_playlist_depth = 4
     initial_timeout = 5
-    max_timeout = timeout
+    geoblock_statuses = {403, 451, 426}
+    secondary_geoblock_statuses = {401, 423, 451}
+
+    def is_playlist(content_type, target_url):
+        lowered_type = content_type.lower()
+        lowered_url = target_url.lower()
+        return (
+            'application/vnd.apple.mpegurl' in lowered_type
+            or 'application/x-mpegurl' in lowered_type
+            or lowered_url.endswith('.m3u8')
+        )
+
+    def extract_next_url(base_url, playlist_body):
+        pending_variant = False
+        for raw_line in playlist_body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                if line.upper().startswith('#EXT-X-STREAM-INF'):
+                    pending_variant = True
+                continue
+            if pending_variant:
+                pending_variant = False
+            return urljoin(base_url, line)
+        return None
+
+    def read_stream(response, min_bytes):
+        bytes_read = 0
+        stable_connection = True
+        for chunk in response.iter_content(1024 * 128):  # 128KB chunks
+            if not chunk:
+                stable_connection = False
+                break
+            bytes_read += len(chunk)
+            if bytes_read >= min_bytes:
+                logging.debug(f"Data received: {bytes_read} bytes")
+                return 'Alive', response.url
+
+        logging.debug(f"Data received: {bytes_read} bytes")
+        if not stable_connection:
+            logging.debug("Unstable connection detected")
+            return 'Dead', None
+        if min_bytes >= min_data_threshold:
+            fallback_threshold = min_bytes
+        else:
+            fallback_threshold = max(32768, min_bytes // 2)  # Allow smaller segments to pass
+        if bytes_read >= fallback_threshold:
+            return 'Alive', response.url
+        return 'Dead', None
+
+    def verify(target_url, current_timeout, depth, visited):
+        if depth > max_playlist_depth:
+            logging.debug("Maximum playlist nesting depth reached")
+            return 'Dead', None
+
+        normalized_url = target_url.split('#')[0]
+        if normalized_url in visited:
+            logging.debug(f"Detected playlist loop at {target_url}")
+            return 'Dead', None
+        visited.add(normalized_url)
+
+        playlist_text = None
+        final_url = target_url
+
+        try:
+            with requests.get(
+                target_url,
+                stream=True,
+                timeout=(initial_timeout, current_timeout),
+                headers=headers
+            ) as resp:
+                if resp.status_code == 429:
+                    logging.debug("Rate limit exceeded, retrying...")
+                    return 'Retry', None
+                if resp.status_code in geoblock_statuses:
+                    logging.debug(f"Potential geoblock detected: HTTP {resp.status_code}")
+                    return 'Geoblocked', None
+                if resp.status_code != 200:
+                    logging.debug(f"HTTP status code not OK: {resp.status_code}")
+                    if resp.status_code in secondary_geoblock_statuses:
+                        return 'Geoblocked', None
+                    return 'Dead', None
+
+                content_type = resp.headers.get('Content-Type', '')
+                logging.debug(f"Content-Type: {content_type}")
+
+                final_url = resp.url
+                if is_playlist(content_type, final_url):
+                    playlist_text = resp.text
+                elif (
+                    'video/mp2t' in content_type.lower()
+                    or final_url.lower().endswith('.ts')
+                    or 'video/mp4' in content_type.lower()
+                ):
+                    min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
+                    return read_stream(resp, min_bytes)
+                else:
+                    logging.debug(f"Content-Type not recognized as stream: {content_type}")
+                    return 'Dead', None
+        except requests.ConnectionError:
+            logging.error("Connection error occurred")
+            return 'Dead', None
+        except requests.Timeout:
+            logging.error("Timeout occurred")
+            return 'Dead', None
+        except requests.RequestException as e:
+            logging.error(f"Request failed: {str(e)}")
+            return 'Dead', None
+
+        if not playlist_text:
+            logging.debug("Playlist response was empty")
+            return 'Dead', None
+
+        next_url = extract_next_url(final_url, playlist_text)
+        if not next_url:
+            logging.debug("No media segments found in playlist")
+            return 'Dead', None
+
+        logging.debug(f"Following playlist entry: {next_url}")
+        return verify(next_url, current_timeout, depth + 1, visited)
 
     def attempt_check(current_timeout):
-        accumulated_data = 0
-        stable_connection = True
         for attempt in range(retries):
-            try:
-                with requests.get(url, stream=True, timeout=(initial_timeout, current_timeout), headers=headers) as resp:
-                    if resp.status_code == 429:
-                        logging.debug(f"Rate limit exceeded, retrying...")
-                        time.sleep(2)
-                        continue
-                    elif resp.status_code in [403, 451, 426]:  # Geoblock indicators
-                        logging.debug(f"Potential geoblock detected: HTTP {resp.status_code}")
-                        return 'Geoblocked'
-                    elif resp.status_code == 200:
-                        content_type = resp.headers.get('Content-Type', '')
-                        logging.debug(f"Content-Type: {content_type}")
-
-                        # ----- FIXED CONTENT-TYPE CHECK -----
-                        if ('video/mp2t' in content_type 
-                            or '.ts' in url 
-                            or 'application/vnd.apple.mpegurl' in content_type
-                            or 'application/x-mpegurl' in content_type.lower()):
-                            for chunk in resp.iter_content(1024 * 1024):  # 1MB chunks
-                                if not chunk:
-                                    stable_connection = False
-                                    break
-
-                                accumulated_data += len(chunk)
-                                if accumulated_data >= min_data_threshold:
-                                    logging.debug(f"Data received: {accumulated_data} bytes")
-                                    return 'Alive'
-
-                            logging.debug(f"Data received: {accumulated_data} bytes")
-                            if not stable_connection:
-                                logging.debug("Unstable connection detected")
-                                return 'Dead'
-                        else:
-                            logging.debug(f"Content-Type not recognized as stream: {content_type}")
-                            return 'Dead'
-                    else:
-                        logging.debug(f"HTTP status code not OK: {resp.status_code}")
-                        # Check for other potential geoblock indicators
-                        if resp.status_code in [401, 423, 451]:
-                            return 'Geoblocked'
-                        return 'Dead'
-            except requests.ConnectionError:
-                logging.error("Connection error occurred")
-                return 'Dead'
-            except requests.Timeout:
-                logging.error("Timeout occurred")
-                return 'Dead'
-            except requests.RequestException as e:
-                logging.error(f"Request failed: {str(e)}")
-                return 'Dead'
-
+            visited = set()
+            status, stream_url = verify(url, current_timeout, 0, visited)
+            if status == 'Retry':
+                time.sleep(2)
+                continue
+            return status, stream_url
         logging.error("Maximum retries exceeded for checking channel status")
-        return 'Dead'
+        return 'Dead', None
 
     # First attempt with the initial timeout
-    status = attempt_check(timeout)
+    status, stream_url = attempt_check(timeout)
 
     # If the channel is detected as dead and extended_timeout is specified, retry with extended timeout
     if status == 'Dead' and extended_timeout:
         logging.info(f"Channel initially detected as dead. Retrying with an extended timeout of {extended_timeout} seconds.")
-        status = attempt_check(extended_timeout)
+        status, stream_url = attempt_check(extended_timeout)
     
     # If geoblocked and proxy testing is enabled, test with proxies
     if status == 'Geoblocked' and test_geoblock and proxy_list:
@@ -227,31 +303,29 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         for proxy in random.sample(proxy_list, min(3, len(proxy_list))):  # Test up to 3 random proxies
             if test_with_proxy(url, proxy, timeout):
                 logging.info(f"Stream accessible via proxy {proxy} - confirming geoblock")
-                return 'Geoblocked (Confirmed)'
+                return 'Geoblocked (Confirmed)', None
         logging.info("Stream not accessible via tested proxies")
-        return 'Geoblocked (Unconfirmed)'
+        return 'Geoblocked (Unconfirmed)', None
 
     # Final Verification using ffmpeg/ffprobe for streams marked alive
     if status == 'Alive':
+        verification_url = stream_url or url
         try:
             command = [
-                'ffmpeg', '-i', url, '-t', '5', '-f', 'null', '-'
+                'ffmpeg', '-user_agent', headers['User-Agent'], '-i', verification_url, '-t', '5', '-f', 'null', '-'
             ]
             ffmpeg_result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
             if ffmpeg_result.returncode != 0:
-                logging.debug(f"ffmpeg failed to read stream; marking as dead")
-                status = 'Dead'
+                logging.warning(f"ffmpeg failed to read stream ({verification_url}); continuing with HTTP validation result")
         except FileNotFoundError:
             logging.warning(f"ffmpeg not found for stream verification, skipping ffmpeg check")
             # Keep status as 'Alive' since we already verified via HTTP
         except subprocess.TimeoutExpired:
-            logging.error(f"Timeout when trying to verify stream with ffmpeg for {url}")
-            status = 'Dead'
+            logging.warning(f"Timeout when trying to verify stream with ffmpeg for {verification_url}; continuing with HTTP validation result")
         except Exception as e:
-            logging.error(f"Error verifying stream with ffmpeg: {str(e)}")
-            status = 'Dead'
+            logging.warning(f"Error verifying stream with ffmpeg ({verification_url}): {str(e)}; continuing with HTTP validation result")
 
-    return status
+    return status, stream_url
 
 def capture_frame(url, output_path, file_name):
     command = [
@@ -500,20 +574,21 @@ def parse_m3u8_file(file_path, group_title, timeout, log_file, extended_timeout,
                     identifier = f"{channel_name} {next_line}"
                     if identifier not in processed_channels:
                         current_channel += 1
-                        status = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
+                        status, stream_url = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
                         video_info = "Unknown"
                         audio_info = "Unknown"
                         fps = None
                         if status == 'Alive':
-                            video_info, resolution, fps = get_stream_info(next_line)
-                            audio_info = get_audio_bitrate(next_line)
+                            target_url = stream_url or next_line
+                            video_info, resolution, fps = get_stream_info(target_url)
+                            audio_info = get_audio_bitrate(target_url)
                             mismatches = check_label_mismatch(channel_name, resolution)
                             if fps is not None and fps <= 30:
                                 low_framerate_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
                             if mismatches:
                                 mislabeled_channels.append(f"{current_channel}/{total_channels} {channel_name} - \033[91m{', '.join(mismatches)}\033[0m")
                             file_name = f"{current_channel}-{channel_name.replace('/', '-')}"  # Replace '/' to avoid path issues
-                            capture_frame(next_line, output_folder, file_name)
+                            capture_frame(target_url, output_folder, file_name)
                             
                             if rename:
                                 # Create the new channel name in the desired format
