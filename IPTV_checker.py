@@ -563,7 +563,7 @@ def load_processed_channels(log_file):
     return processed_channels, last_index
 
 def write_log_entry(log_file, entry):
-    with open(log_file, 'a') as f:
+    with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
         f.write(entry + "\n")
 
 def file_log_entry(f_output, playlist_file, current_channel, total_channels, group_name, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info):
@@ -913,3 +913,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
