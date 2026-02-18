@@ -11,7 +11,7 @@ import random
 import json
 import codecs
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 def print_header():
     header_text = """
@@ -92,31 +92,32 @@ def get_video_bitrate(url):
         return "N/A"
 
 def check_ffmpeg_availability():
-    """Check if ffmpeg and ffprobe are available in the system PATH"""
-    tools_available = True
-    
+    """Check whether ffmpeg and ffprobe are available in the system PATH."""
+    tool_status = {}
+
     for tool in ['ffmpeg', 'ffprobe']:
+        available = False
         try:
-            result = subprocess.run([tool, '-version'], 
-                                  stdout=subprocess.PIPE, 
-                                  stderr=subprocess.PIPE, 
-                                  timeout=5)
+            result = subprocess.run(
+                [tool, '-version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5
+            )
             if result.returncode == 0:
                 logging.debug(f"{tool} is available")
+                available = True
             else:
                 logging.error(f"{tool} is installed but not working properly")
-                tools_available = False
         except FileNotFoundError:
             logging.error(f"{tool} is not found in system PATH. Please install {tool} to use this tool.")
-            tools_available = False
         except subprocess.TimeoutExpired:
             logging.error(f"{tool} check timed out")
-            tools_available = False
         except Exception as e:
             logging.error(f"Error checking {tool}: {str(e)}")
-            tools_available = False
-    
-    return tools_available
+        tool_status[tool] = available
+
+    return tool_status
 
 def test_with_proxy(url, proxy, timeout, retries=3):
     """
@@ -125,24 +126,37 @@ def test_with_proxy(url, proxy, timeout, retries=3):
     headers = {
         'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
-    
-    try:
-        proxies = {'http': proxy, 'https': proxy}
-        with requests.get(url, stream=True, timeout=(5, timeout), headers=headers, proxies=proxies) as resp:
-            if resp.status_code == 200:
+    proxies = {'http': proxy, 'https': proxy}
+    stream_extensions = ('.ts', '.m2ts', '.m4s', '.mp4', '.aac', '.m3u8')
+
+    for attempt in range(max(1, retries)):
+        try:
+            with requests.get(url, stream=True, timeout=(5, timeout), headers=headers, proxies=proxies) as resp:
+                if resp.status_code != 200:
+                    continue
                 content_type = resp.headers.get('Content-Type', '')
-                if ('video/mp2t' in content_type 
-                    or '.ts' in url 
-                    or 'application/vnd.apple.mpegurl' in content_type
-                    or 'application/x-mpegurl' in content_type.lower()):
+                lowered_type = content_type.lower()
+                stream_path = urlparse(resp.url).path.lower()
+                if (
+                    lowered_type.startswith('video/')
+                    or lowered_type.startswith('audio/')
+                    or 'application/vnd.apple.mpegurl' in lowered_type
+                    or 'application/x-mpegurl' in lowered_type
+                    or 'application/octet-stream' in lowered_type
+                    or 'application/mp4' in lowered_type
+                    or stream_path.endswith(stream_extensions)
+                ):
                     # Read some data to verify stream
                     for chunk in resp.iter_content(1024 * 500):  # 500KB
                         if chunk:
                             return True
-            return False
-    except Exception as e:
-        logging.debug(f"Proxy test failed with {proxy}: {str(e)}")
-        return False
+        except requests.RequestException as e:
+            logging.debug(f"Proxy test failed with {proxy} (attempt {attempt + 1}/{max(1, retries)}): {str(e)}")
+
+        if attempt + 1 < max(1, retries):
+            time.sleep(0.5 * (attempt + 1))
+
+    return False
 
 def load_proxy_list(proxy_file):
     """
@@ -200,7 +214,7 @@ def load_proxy_list(proxy_file):
     
     return proxies
 
-def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False):
+def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True):
     headers = {
         'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
@@ -222,14 +236,14 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
 
     def is_direct_stream(content_type, target_url):
         lowered_type = content_type.lower()
-        lowered_url = target_url.lower()
+        lowered_path = urlparse(target_url).path.lower()
         stream_extensions = ('.ts', '.m2ts', '.m4s', '.mp4', '.aac')
         return (
             lowered_type.startswith('video/')
             or lowered_type.startswith('audio/')
             or 'application/octet-stream' in lowered_type
             or 'application/mp4' in lowered_type
-            or lowered_url.endswith(stream_extensions)
+            or lowered_path.endswith(stream_extensions)
         )
 
     def extract_next_url(base_url, playlist_body):
@@ -320,12 +334,12 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                     logging.debug(f"Unrecognized Content-Type '{content_type}'. Attempting fallback stream read.")
                     min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
                     return read_stream(resp, min_bytes)
-        except requests.ConnectionError:
-            logging.error("Connection error occurred")
-            return 'Dead', None
-        except requests.Timeout:
-            logging.error("Timeout occurred")
-            return 'Dead', None
+        except requests.ConnectionError as exc:
+            logging.warning(f"Connection error occurred for {target_url}: {exc}")
+            return 'Retry', None
+        except requests.Timeout as exc:
+            logging.warning(f"Timeout occurred for {target_url}: {exc}")
+            return 'Retry', None
         except requests.RequestException as e:
             logging.error(f"Request failed: {str(e)}")
             return 'Dead', None
@@ -347,7 +361,8 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             visited = set()
             status, stream_url = verify(url, current_timeout, 0, visited)
             if status == 'Retry':
-                time.sleep(2)
+                logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{retries})")
+                time.sleep(min(2 + attempt, 5))
                 continue
             return status, stream_url
         logging.error("Maximum retries exceeded for checking channel status")
@@ -372,7 +387,7 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         return 'Geoblocked (Unconfirmed)', None
 
     # Final Verification using ffmpeg/ffprobe for streams marked alive
-    if status == 'Alive':
+    if status == 'Alive' and ffmpeg_available:
         verification_url = stream_url or url
         try:
             command = [
@@ -559,11 +574,31 @@ def get_channel_id(url):
         return segment.replace('.ts', '')
     return "Unknown"
 
+def get_channel_stream_entry(lines, extinf_index):
+    """
+    Return (stream_url, metadata_lines, end_index) for a channel entry starting at #EXTINF.
+    metadata_lines includes intermediary comment/blank lines between #EXTINF and the stream URL.
+    """
+    metadata_lines = []
+    j = extinf_index + 1
+    while j < len(lines):
+        candidate = lines[j].strip()
+        if candidate.startswith('#EXTINF'):
+            return None, metadata_lines, j - 1
+        if not candidate or candidate.startswith('#'):
+            metadata_lines.append(candidate)
+            j += 1
+            continue
+        return candidate, metadata_lines, j
+    return None, metadata_lines, len(lines) - 1
+
 def is_line_needed(line, group_title, pattern):
     if not line.startswith('#EXTINF'):
         return False
-    if group_title and group_title not in line:
-        return False
+    if group_title:
+        group_name = get_group_name(line).strip().lower()
+        if group_name != group_title.strip().lower():
+            return False
     if pattern:
         channel_name = get_channel_name(line)
         if not pattern.search(channel_name):
@@ -586,9 +621,13 @@ def load_processed_channels(log_file):
             for line in f:
                 parts = line.rstrip('\n').split(' - ', 1)
                 if len(parts) > 1:
-                    index_part = parts[0].strip().split()[0]
-                    if index_part.isdigit():
-                        last_index = max(last_index, int(index_part))
+                    index_source = parts[0].strip()
+                    if index_source:
+                        index_tokens = index_source.split()
+                        if index_tokens:
+                            index_part = index_tokens[0]
+                            if index_part.isdigit():
+                                last_index = max(last_index, int(index_part))
                     processed_channels.add(parts[1].strip())
     return processed_channels, last_index
 
@@ -653,17 +692,20 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, proxy_list=None, test_geoblock=False, profile_bitrate=False):
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True):
     if not playlists:
         logging.error("No playlists to process.")
         return
 
     group_suffix = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
-    try:
-        pattern = compile_channel_pattern(channel_search)
-    except ValueError as exc:
-        logging.error(str(exc))
-        return
+    if channel_pattern is not None:
+        pattern = channel_pattern
+    else:
+        try:
+            pattern = compile_channel_pattern(channel_search)
+        except ValueError as exc:
+            logging.error(str(exc))
+            return
     console_width = shutil.get_terminal_size((80, 20)).columns
 
     low_framerate_channels = []
@@ -698,7 +740,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
             output_folder = os.path.join(playlist_dir, f"{base_playlist_name}_{group_suffix}_screenshots")
             try:
                 os.makedirs(output_folder, exist_ok=True)
-            except Exception as exc:
+            except OSError as exc:
                 logging.error(f"Failed to create output folder '{output_folder}': {exc}")
                 output_folder = None
 
@@ -739,33 +781,44 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         while i < len(lines):
             line = lines[i].strip()
             if is_line_needed(line, group_title, pattern):
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    channel_name = get_channel_name(line)
-                    identifier = f"{channel_name} {next_line}"
+                channel_name = get_channel_name(line)
+                stream_line, channel_metadata_lines, channel_end_index = get_channel_stream_entry(lines, i)
+                if stream_line:
+                    identifier = f"{channel_name} {stream_line}"
                     if identifier not in processed_channels:
                         current_channel += 1
-                        status, stream_url = check_channel_status(next_line, timeout, extended_timeout=extended_timeout, proxy_list=proxy_list, test_geoblock=test_geoblock)
+                        status, stream_url = check_channel_status(
+                            stream_line,
+                            timeout,
+                            extended_timeout=extended_timeout,
+                            proxy_list=proxy_list,
+                            test_geoblock=test_geoblock,
+                            ffmpeg_available=ffmpeg_available
+                        )
                         video_info = "Unknown"
                         audio_info = "Unknown"
                         codec_name = "Unknown"
                         video_bitrate = "Unknown"
                         resolution = "Unknown"
                         fps = None
-                        channel_id = get_channel_id(next_line)
+                        channel_id = get_channel_id(stream_line)
                         group_value = get_group_name(line)
 
                         if status == 'Alive':
-                            target_url = stream_url or next_line
-                            codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(target_url, profile_bitrate=profile_bitrate)
-                            video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
-                            audio_info = get_audio_bitrate(target_url)
-                            mismatches = check_label_mismatch(channel_name, resolution)
-                            if fps is not None and fps <= 30:
-                                low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
-                            if mismatches:
-                                mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
-                            if not skip_screenshots and output_folder:
+                            target_url = stream_url or stream_line
+                            if ffprobe_available:
+                                codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
+                                    target_url,
+                                    profile_bitrate=profile_bitrate and ffmpeg_available
+                                )
+                                video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
+                                audio_info = get_audio_bitrate(target_url)
+                                mismatches = check_label_mismatch(channel_name, resolution)
+                                if fps is not None and fps <= 30:
+                                    low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
+                                if mismatches:
+                                    mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+                            if not skip_screenshots and output_folder and ffmpeg_available:
                                 file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
                                 capture_frame(target_url, output_folder, file_name)
 
@@ -777,13 +830,13 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                                     line = ','.join(extinf_parts)
 
                             if split:
-                                working_channels.append((line, next_line))
+                                working_channels.append([line, *channel_metadata_lines, stream_line])
                         elif 'Geoblocked' in status:
-                            geoblocked_channels.append((line, next_line))
+                            geoblocked_channels.append([line, *channel_metadata_lines, stream_line])
                             geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
                         else:
                             if split:
-                                dead_channels.append((line, next_line))
+                                dead_channels.append([line, *channel_metadata_lines, stream_line])
 
                         console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
                         processed_channels.add(identifier)
@@ -793,10 +846,13 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                         logging.debug(f"Skipping previously processed channel: {channel_name}")
 
                     renamed_lines.append(line)
-                    renamed_lines.append(next_line)
-                    i += 1
+                    renamed_lines.extend(channel_metadata_lines)
+                    renamed_lines.append(stream_line)
                 else:
+                    logging.warning(f"No stream URL found for channel '{channel_name}' in {playlist_file}")
                     renamed_lines.append(line)
+                    renamed_lines.extend(channel_metadata_lines)
+                i = max(i, channel_end_index)
             else:
                 renamed_lines.append(line)
             i += 1
@@ -810,29 +866,31 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                 with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
                     working_file.write("#EXTM3U\n")
                     for entry in working_channels:
-                        working_file.write(entry[0] + "\n")
-                        working_file.write(entry[1] + "\n")
+                        for entry_line in entry:
+                            working_file.write(entry_line + "\n")
                 logging.info(f"Working channels playlist saved to {working_playlist_path}")
 
             if dead_channels:
                 with open(dead_playlist_path, 'w', encoding='utf-8') as dead_file:
                     dead_file.write("#EXTM3U\n")
                     for entry in dead_channels:
-                        dead_file.write(entry[0] + "\n")
-                        dead_file.write(entry[1] + "\n")
+                        for entry_line in entry:
+                            dead_file.write(entry_line + "\n")
                 logging.info(f"Dead channels playlist saved to {dead_playlist_path}")
 
             if geoblocked_channels:
                 with open(geoblocked_playlist_path, 'w', encoding='utf-8') as geoblocked_file:
                     geoblocked_file.write("#EXTM3U\n")
                     for entry in geoblocked_channels:
-                        geoblocked_file.write(entry[0] + "\n")
-                        geoblocked_file.write(entry[1] + "\n")
+                        for entry_line in entry:
+                            geoblocked_file.write(entry_line + "\n")
                 logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
         if rename:
             renamed_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_renamed.m3u8")
             with open(renamed_playlist_path, 'w', encoding='utf-8') as renamed_file:
-                renamed_file.write("#EXTM3U\n")
+                has_header = any(entry.upper().startswith("#EXTM3U") for entry in renamed_lines if entry)
+                if not has_header:
+                    renamed_file.write("#EXTM3U\n")
                 for line in renamed_lines:
                     renamed_file.write(line + "\n")
             logging.info(f"Renamed playlist saved to {renamed_playlist_path}")
@@ -883,16 +941,22 @@ def main():
     args = parser.parse_args()
 
     try:
-        compile_channel_pattern(args.channel_search)
+        channel_pattern = compile_channel_pattern(args.channel_search)
     except ValueError as exc:
         parser.error(str(exc))
 
     setup_logging(args.v)
 
     # Check for ffmpeg and ffprobe availability
-    if not check_ffmpeg_availability():
+    tool_status = check_ffmpeg_availability()
+    ffmpeg_available = tool_status.get('ffmpeg', False)
+    ffprobe_available = tool_status.get('ffprobe', False)
+    if not (ffmpeg_available and ffprobe_available):
         logging.warning("ffmpeg and/or ffprobe not found. Some features will be disabled.")
         print("\033[93mWarning: ffmpeg and/or ffprobe not found. Screenshot capture and media info detection will be disabled.\033[0m")
+    if args.profile_bitrate and not ffmpeg_available:
+        logging.warning("Bitrate profiling requires ffmpeg. Disabling --profile-bitrate.")
+        args.profile_bitrate = False
 
     # Load proxy list if provided
     proxy_list = None
@@ -940,9 +1004,12 @@ def main():
         skip_screenshots=args.skip_screenshots,
         output_file=output_file,
         channel_search=args.channel_search,
+        channel_pattern=channel_pattern,
         proxy_list=proxy_list,
         test_geoblock=args.test_geoblock,
-        profile_bitrate=args.profile_bitrate
+        profile_bitrate=args.profile_bitrate,
+        ffmpeg_available=ffmpeg_available,
+        ffprobe_available=ffprobe_available
     )
 
 if __name__ == "__main__":
