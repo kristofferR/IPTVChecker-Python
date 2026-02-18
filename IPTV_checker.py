@@ -33,7 +33,7 @@ def setup_logging(verbose_level):
     elif verbose_level >= 2:
         logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
     else:
-        logging.basicConfig(level=logging.CRITICAL)  # Only critical errors will be logged by default.
+        logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def handle_sigint(signum, frame):
     logging.info("Interrupt received, stopping...")
@@ -220,6 +220,18 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             or lowered_url.endswith('.m3u8')
         )
 
+    def is_direct_stream(content_type, target_url):
+        lowered_type = content_type.lower()
+        lowered_url = target_url.lower()
+        stream_extensions = ('.ts', '.m2ts', '.m4s', '.mp4', '.aac')
+        return (
+            lowered_type.startswith('video/')
+            or lowered_type.startswith('audio/')
+            or 'application/octet-stream' in lowered_type
+            or 'application/mp4' in lowered_type
+            or lowered_url.endswith(stream_extensions)
+        )
+
     def extract_next_url(base_url, playlist_body):
         pending_variant = False
         for raw_line in playlist_body.splitlines():
@@ -298,16 +310,16 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                 final_url = resp.url
                 if is_playlist(content_type, final_url):
                     playlist_text = resp.text
-                elif (
-                    'video/mp2t' in content_type.lower()
-                    or final_url.lower().endswith('.ts')
-                    or 'video/mp4' in content_type.lower()
-                ):
+                elif is_direct_stream(content_type, final_url):
                     min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
                     return read_stream(resp, min_bytes)
                 else:
-                    logging.debug(f"Content-Type not recognized as stream: {content_type}")
-                    return 'Dead', None
+                    if content_type.lower().startswith('text/'):
+                        logging.debug(f"Content-Type not recognized as stream: {content_type}")
+                        return 'Dead', None
+                    logging.debug(f"Unrecognized Content-Type '{content_type}'. Attempting fallback stream read.")
+                    min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
+                    return read_stream(resp, min_bytes)
         except requests.ConnectionError:
             logging.error("Connection error occurred")
             return 'Dead', None
@@ -418,9 +430,19 @@ def get_detailed_stream_info(url, profile_bitrate=False):
                 height = int(line.split('=')[1])
             elif line.startswith("r_frame_rate="):
                 fps_data = line.split('=')[1]
-                if fps_data and '/' in fps_data:
-                    numerator, denominator = map(int, fps_data.split('/'))
-                    fps = round(numerator / denominator)
+                if not fps_data:
+                    continue
+                try:
+                    if '/' in fps_data:
+                        numerator_str, denominator_str = fps_data.split('/', 1)
+                        numerator = float(numerator_str)
+                        denominator = float(denominator_str)
+                        if denominator > 0:
+                            fps = round(numerator / denominator)
+                    else:
+                        fps = round(float(fps_data))
+                except ValueError:
+                    logging.debug(f"Unable to parse frame rate '{fps_data}' for {url}")
 
         # Determine resolution string with FPS
         resolution = "Unknown"
@@ -548,18 +570,26 @@ def is_line_needed(line, group_title, pattern):
             return False
     return True
 
+def compile_channel_pattern(channel_search):
+    if not channel_search:
+        return None
+    try:
+        return re.compile(channel_search, flags=re.IGNORECASE)
+    except re.error as exc:
+        raise ValueError(f"Invalid channel search regex '{channel_search}': {exc}") from exc
+
 def load_processed_channels(log_file):
     processed_channels = set()
     last_index = 0
     if os.path.exists(log_file):
-        with open(log_file, 'r') as f:
+        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
-                parts = line.strip().split(' - ')
+                parts = line.rstrip('\n').split(' - ', 1)
                 if len(parts) > 1:
-                    index_part = parts[0].split()[0]
+                    index_part = parts[0].strip().split()[0]
                     if index_part.isdigit():
                         last_index = max(last_index, int(index_part))
-                    processed_channels.add(parts[1])
+                    processed_channels.add(parts[1].strip())
     return processed_channels, last_index
 
 def write_log_entry(log_file, entry):
@@ -629,7 +659,11 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         return
 
     group_suffix = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
-    pattern = re.compile(channel_search, flags=re.IGNORECASE) if channel_search else None
+    try:
+        pattern = compile_channel_pattern(channel_search)
+    except ValueError as exc:
+        logging.error(str(exc))
+        return
     console_width = shutil.get_terminal_size((80, 20)).columns
 
     low_framerate_channels = []
@@ -656,18 +690,19 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
     for file_path in playlists:
         playlist_file = os.path.basename(file_path)
         base_playlist_name = os.path.splitext(playlist_file)[0]
+        playlist_dir = os.path.dirname(file_path) or '.'
         logging.info(f"Loading channels from {file_path} with group '{group_title}' and search '{channel_search if channel_search else 'None'}'...")
 
         output_folder = None
         if not skip_screenshots:
-            output_folder = f"{base_playlist_name}_{group_suffix}_screenshots"
+            output_folder = os.path.join(playlist_dir, f"{base_playlist_name}_{group_suffix}_screenshots")
             try:
                 os.makedirs(output_folder, exist_ok=True)
             except Exception as exc:
                 logging.error(f"Failed to create output folder '{output_folder}': {exc}")
                 output_folder = None
 
-        log_file = f"{base_playlist_name}_{group_suffix}_checklog.txt"
+        log_file = os.path.join(playlist_dir, f"{base_playlist_name}_{group_suffix}_checklog.txt")
         processed_channels, last_index = load_processed_channels(log_file)
         current_channel = last_index
         working_channels = []
@@ -767,9 +802,9 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
             i += 1
 
         if split:
-            working_playlist_path = f"{base_playlist_name}_working.m3u8"
-            dead_playlist_path = f"{base_playlist_name}_dead.m3u8"
-            geoblocked_playlist_path = f"{base_playlist_name}_geoblocked.m3u8"
+            working_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_working.m3u8")
+            dead_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_dead.m3u8")
+            geoblocked_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_geoblocked.m3u8")
 
             if working_channels:
                 with open(working_playlist_path, 'w', encoding='utf-8') as working_file:
@@ -794,8 +829,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                         geoblocked_file.write(entry[0] + "\n")
                         geoblocked_file.write(entry[1] + "\n")
                 logging.info(f"Geoblocked channels playlist saved to {geoblocked_playlist_path}")
-        elif rename:
-            renamed_playlist_path = f"{base_playlist_name}_renamed.m3u8"
+        if rename:
+            renamed_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_renamed.m3u8")
             with open(renamed_playlist_path, 'w', encoding='utf-8') as renamed_file:
                 renamed_file.write("#EXTM3U\n")
                 for line in renamed_lines:
@@ -847,13 +882,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Set up logging based on verbosity level
-    if args.v == 1:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    elif args.v >= 2:
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-    else:
-        logging.basicConfig(level=logging.CRITICAL)  # Only critical errors will be logged by default.
+    try:
+        compile_channel_pattern(args.channel_search)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    setup_logging(args.v)
 
     # Check for ffmpeg and ffprobe availability
     if not check_ffmpeg_availability():
