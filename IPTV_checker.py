@@ -114,7 +114,7 @@ def check_ffmpeg_availability():
         except subprocess.TimeoutExpired:
             logging.error(f"{tool} check timed out")
         except Exception as e:
-            logging.error(f"Error checking {tool}: {str(e)}")
+            logging.exception(f"Unexpected error checking {tool}: {e}")
         tool_status[tool] = available
 
     return tool_status
@@ -228,10 +228,11 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
     def is_playlist(content_type, target_url):
         lowered_type = content_type.lower()
         lowered_url = target_url.lower()
+        lowered_path = urlparse(lowered_url).path
         return (
             'application/vnd.apple.mpegurl' in lowered_type
             or 'application/x-mpegurl' in lowered_type
-            or lowered_url.endswith('.m3u8')
+            or lowered_path.endswith('.m3u8')
         )
 
     def is_direct_stream(content_type, target_url):
@@ -362,7 +363,8 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             status, stream_url = verify(url, current_timeout, 0, visited)
             if status == 'Retry':
                 logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{retries})")
-                time.sleep(min(2 + attempt, 5))
+                if attempt + 1 < max(1, retries):
+                    time.sleep(min(2 + attempt, 5))
                 continue
             return status, stream_url
         logging.error("Maximum retries exceeded for checking channel status")
@@ -832,7 +834,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                             if split:
                                 working_channels.append([line, *channel_metadata_lines, stream_line])
                         elif 'Geoblocked' in status:
-                            geoblocked_channels.append([line, *channel_metadata_lines, stream_line])
+                            if split:
+                                geoblocked_channels.append([line, *channel_metadata_lines, stream_line])
                             geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
                         else:
                             if split:
@@ -955,7 +958,8 @@ def main():
         logging.warning("ffmpeg and/or ffprobe not found. Some features will be disabled.")
         print("\033[93mWarning: ffmpeg and/or ffprobe not found. Screenshot capture and media info detection will be disabled.\033[0m")
     if args.profile_bitrate and not ffmpeg_available:
-        logging.warning("Bitrate profiling requires ffmpeg. Disabling --profile-bitrate.")
+        logging.error("Disabling args.profile_bitrate because ffmpeg_available is False.")
+        print("\033[93mWarning: args.profile_bitrate disabled because ffmpeg_available is False.\033[0m")
         args.profile_bitrate = False
 
     # Load proxy list if provided
