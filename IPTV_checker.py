@@ -709,18 +709,110 @@ def check_label_mismatch(channel_name, resolution):
 
     return mismatches
 
+def parse_extinf_metadata(extinf_line):
+    """
+    Parse an EXTINF line into attributes and channel name while handling quoted values.
+    """
+    if not extinf_line.startswith('#EXTINF'):
+        return {}, "Unknown Channel"
+
+    _, _, payload = extinf_line.partition(':')
+    if not payload:
+        return {}, "Unknown Channel"
+
+    in_quotes = False
+    escape_next = False
+    split_index = -1
+    for idx, char in enumerate(payload):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\':
+            escape_next = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == ',' and not in_quotes:
+            split_index = idx
+            break
+
+    if split_index >= 0:
+        metadata_payload = payload[:split_index]
+        channel_name = payload[split_index + 1:].strip() or "Unknown Channel"
+    else:
+        metadata_payload = payload
+        channel_name = "Unknown Channel"
+
+    attributes = {}
+    metadata = metadata_payload.strip()
+    index = 0
+    metadata_length = len(metadata)
+
+    while index < metadata_length:
+        while index < metadata_length and metadata[index].isspace():
+            index += 1
+        if index >= metadata_length:
+            break
+
+        key_start = index
+        while index < metadata_length and not metadata[index].isspace() and metadata[index] != '=':
+            index += 1
+        key = metadata[key_start:index].strip().lower()
+
+        if not key:
+            if index < metadata_length:
+                index += 1
+            continue
+
+        equals_index = index
+        while equals_index < metadata_length and metadata[equals_index].isspace():
+            equals_index += 1
+
+        if equals_index >= metadata_length or metadata[equals_index] != '=':
+            # Token without '=' (e.g., duration) is ignored.
+            index = equals_index
+            continue
+
+        index = equals_index + 1
+        while index < metadata_length and metadata[index].isspace():
+            index += 1
+
+        if index < metadata_length and metadata[index] == '"':
+            index += 1
+            value_chars = []
+            while index < metadata_length:
+                char = metadata[index]
+                if char == '\\' and index + 1 < metadata_length:
+                    value_chars.append(metadata[index + 1])
+                    index += 2
+                    continue
+                if char == '"':
+                    index += 1
+                    break
+                value_chars.append(char)
+                index += 1
+            value = ''.join(value_chars)
+        else:
+            value_start = index
+            while index < metadata_length and not metadata[index].isspace():
+                index += 1
+            value = metadata[value_start:index].strip()
+
+        if key:
+            attributes[key] = value
+
+    return attributes, channel_name
+
 def get_channel_name(extinf_line):
-    if extinf_line.startswith('#EXTINF') and ',' in extinf_line:
-        return extinf_line.split(',', 1)[1].strip()
-    return "Unknown Channel"
+    _, channel_name = parse_extinf_metadata(extinf_line)
+    return channel_name
 
 def get_group_name(extinf_line):
-    if "group-title=" in extinf_line:
-        segment = extinf_line.split("group-title=", 1)[1]
-        segment = segment.replace("\"", "")
-        if "," in segment:
-            return segment.split(",", 1)[0]
-        return segment
+    attributes, _ = parse_extinf_metadata(extinf_line)
+    group_name = attributes.get('group-title')
+    if group_name:
+        return group_name
     return "Unknown Group"
 
 def get_channel_id(url):
