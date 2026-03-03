@@ -559,12 +559,13 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         return min(attempt_index + 1, 10)
 
     def attempt_check(current_timeout):
-        for attempt in range(retries):
+        total_attempts = max(1, retries)
+        for attempt in range(total_attempts):
             visited = set()
             status, stream_url = verify(url, current_timeout, 0, visited)
             if status == 'Retry':
-                logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{retries})")
-                if attempt + 1 < max(1, retries):
+                logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{total_attempts})")
+                if attempt + 1 < total_attempts:
                     delay_seconds = get_retry_delay(attempt)
                     if delay_seconds > 0:
                         logging.debug(f"Applying {backoff_mode} backoff delay of {delay_seconds}s")
@@ -1077,7 +1078,7 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear'):
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6):
     if not playlists:
         logging.error("No playlists to process.")
         return
@@ -1243,6 +1244,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                                 status, stream_url = check_channel_status(
                                     stream_line,
                                     timeout,
+                                    retries=retries,
                                     extended_timeout=extended_timeout,
                                     proxy_list=proxy_list,
                                     test_geoblock=test_geoblock,
@@ -1425,6 +1427,7 @@ def main():
     parser.add_argument("-rename", "-r", action="store_true", help="Rename alive channels to include video and audio info")
     parser.add_argument("-proxy-list", "-p", type=str, default=None, help="Path to proxy list file for geoblock testing")
     parser.add_argument("-test-geoblock", "-tg", action="store_true", help="Test geoblocked streams with proxies to confirm geoblocking")
+    parser.add_argument("--retries", "-R", type=int, default=6, help="Number of stream-check attempts (0-10)")
     parser.add_argument("-output", "-o", type=str, default=None, help="Write channel details to CSV at the provided path")
     parser.add_argument("-channel_search", "-c", type=str, default=None, help="Regex used to filter channels by name (case-insensitive)")
     parser.add_argument("-skip_screenshots", action="store_true", help="Skip capturing screenshots for alive channels")
@@ -1432,6 +1435,13 @@ def main():
     parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"], default="linear", help="Retry backoff strategy: none, linear (1s,2s,3s...), exponential (1s,2s,4s...)")
 
     args = parser.parse_args()
+
+    if not 0.5 <= args.timeout <= 300:
+        parser.error("`-timeout/--timeout` must be between 0.5 and 300 seconds.")
+    if args.extended is not None and not 1 <= args.extended <= 600:
+        parser.error("`-extended/--extended` must be between 1 and 600 seconds.")
+    if not 0 <= args.retries <= 10:
+        parser.error("`--retries/-R` must be between 0 and 10.")
 
     try:
         channel_pattern = compile_channel_pattern(args.channel_search)
@@ -1502,7 +1512,8 @@ def main():
         profile_bitrate=args.profile_bitrate,
         ffmpeg_available=ffmpeg_available,
         ffprobe_available=ffprobe_available,
-        backoff=args.backoff
+        backoff=args.backoff,
+        retries=args.retries
     )
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
 - **`-rename` or `-r`**: Rename alive channels to include video and audio information in the playlist.
 - **`-proxy-list` or `-p`**: Path to proxy list file for geoblock testing.
 - **`-test-geoblock` or `-tg`**: Test geoblocked streams with proxies to confirm geoblocking.
+- **`--retries` or `-R`**: Number of stream-check attempts (`0` to `10`, default `6`).
 - **`-output` or `-o`**: Write a CSV summary with channel status, codec details, and bitrate.
 - **`-channel_search` or `-c`**: Only process channels whose names match a case-insensitive regular expression.
 - **`-skip_screenshots`**: Skip capturing screenshots for alive channels to speed up runs.
