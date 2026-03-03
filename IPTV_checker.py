@@ -248,19 +248,121 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         )
 
     def extract_next_url(base_url, playlist_body):
-        pending_variant = False
+        def parse_tag_attributes(tag_line):
+            attributes = {}
+            _, _, payload = tag_line.partition(':')
+            if not payload:
+                return attributes
+
+            index = 0
+            payload_length = len(payload)
+            while index < payload_length:
+                while index < payload_length and payload[index] in ' \t,':
+                    index += 1
+                if index >= payload_length:
+                    break
+
+                key_start = index
+                while index < payload_length and payload[index] not in '=,':
+                    index += 1
+                key = payload[key_start:index].strip().upper()
+                if not key:
+                    index += 1
+                    continue
+                if index >= payload_length or payload[index] != '=':
+                    while index < payload_length and payload[index] != ',':
+                        index += 1
+                    continue
+
+                index += 1
+                if index < payload_length and payload[index] == '"':
+                    index += 1
+                    value_chars = []
+                    while index < payload_length:
+                        char = payload[index]
+                        if char == '\\' and index + 1 < payload_length:
+                            value_chars.append(payload[index + 1])
+                            index += 2
+                            continue
+                        if char == '"':
+                            index += 1
+                            break
+                        value_chars.append(char)
+                        index += 1
+                    value = ''.join(value_chars)
+                else:
+                    value_start = index
+                    while index < payload_length and payload[index] != ',':
+                        index += 1
+                    value = payload[value_start:index].strip()
+
+                attributes[key] = value
+                if index < payload_length and payload[index] == ',':
+                    index += 1
+
+            return attributes
+
+        def parse_resolution_pixels(resolution_value):
+            if not resolution_value:
+                return 0
+            match = re.match(r'^\s*(\d+)\s*x\s*(\d+)\s*$', resolution_value, flags=re.IGNORECASE)
+            if not match:
+                return 0
+            width = int(match.group(1))
+            height = int(match.group(2))
+            if width <= 0 or height <= 0:
+                return 0
+            return width * height
+
+        def parse_int(value):
+            if not value:
+                return 0
+            try:
+                parsed = int(value.strip())
+                return parsed if parsed > 0 else 0
+            except (TypeError, ValueError):
+                return 0
+
+        saw_stream_inf = False
+        pending_variant_attrs = None
+        best_variant_url = None
+        best_variant_score = None
+        fallback_url = None
+
         for raw_line in playlist_body.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             if line.startswith('#'):
                 if line.upper().startswith('#EXT-X-STREAM-INF'):
-                    pending_variant = True
+                    saw_stream_inf = True
+                    pending_variant_attrs = parse_tag_attributes(line)
                 continue
-            if pending_variant:
-                pending_variant = False
-            return urljoin(base_url, line)
-        return None
+
+            resolved_url = urljoin(base_url, line)
+            if not saw_stream_inf:
+                return resolved_url
+
+            if pending_variant_attrs is not None:
+                resolution_pixels = parse_resolution_pixels(pending_variant_attrs.get('RESOLUTION'))
+                average_bandwidth = parse_int(pending_variant_attrs.get('AVERAGE-BANDWIDTH'))
+                bandwidth = parse_int(pending_variant_attrs.get('BANDWIDTH'))
+                quality_score = (
+                    1 if resolution_pixels else 0,
+                    resolution_pixels,
+                    average_bandwidth,
+                    bandwidth
+                )
+                if best_variant_score is None or quality_score > best_variant_score:
+                    best_variant_score = quality_score
+                    best_variant_url = resolved_url
+                pending_variant_attrs = None
+            elif fallback_url is None:
+                fallback_url = resolved_url
+
+        if best_variant_url:
+            return best_variant_url
+        return fallback_url
 
     def read_stream(response, min_bytes):
         bytes_read = 0
