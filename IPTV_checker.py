@@ -166,8 +166,43 @@ def load_proxy_list(proxy_file):
     - JSON format with proxy objects (supports both 'protocol' and 'protocols' fields)
     """
     proxies = []
+    valid_proxies = []
+
+    def validate_proxy_entry(proxy_value):
+        if not proxy_value:
+            return None, "entry is empty"
+
+        candidate = proxy_value.strip()
+        if not candidate:
+            return None, "entry is empty"
+        if '://' not in candidate:
+            candidate = f"http://{candidate}"
+
+        parsed = urlparse(candidate)
+        scheme = parsed.scheme.lower()
+        if scheme not in {'http', 'https', 'socks4', 'socks5'}:
+            return None, f"unsupported proxy scheme '{parsed.scheme}'"
+        if not parsed.hostname:
+            return None, "missing proxy host"
+
+        try:
+            port = parsed.port
+        except ValueError:
+            return None, "invalid proxy port"
+        if port is None:
+            return None, "missing proxy port"
+        if port < 1 or port > 65535:
+            return None, f"proxy port {port} is out of range (1-65535)"
+
+        if parsed.path not in ('', '/'):
+            return None, "proxy URL must not include a path"
+        if parsed.params or parsed.query or parsed.fragment:
+            return None, "proxy URL must not include params, query, or fragment"
+
+        return f"{scheme}://{parsed.netloc}", None
+
     try:
-        with open(proxy_file, 'r') as f:
+        with open(proxy_file, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read().strip()
             
             # Try JSON format first
@@ -193,26 +228,34 @@ def load_proxy_list(proxy_file):
                                     proxies.append(f"http://{ip}:{port}")
                         elif isinstance(proxy, str):
                             proxies.append(proxy)
-                return proxies
             except json.JSONDecodeError:
+                # Fall through to plain text format parsing.
                 pass
             
-            # Plain text format
-            lines = content.split('\n')
-            for line in lines:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    if '://' not in line:
-                        # Assume HTTP if no protocol specified
-                        line = f'http://{line}'
-                    proxies.append(line)
+            if not proxies:
+                # Plain text format
+                lines = content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        proxies.append(line)
                     
     except FileNotFoundError:
         logging.error(f"Proxy file not found: {proxy_file}")
     except Exception as e:
         logging.error(f"Error loading proxy file: {str(e)}")
-    
-    return proxies
+
+    for proxy in proxies:
+        validated_proxy, error_message = validate_proxy_entry(proxy)
+        if error_message:
+            logging.error(f"Invalid proxy entry '{proxy}': {error_message}")
+            continue
+        valid_proxies.append(validated_proxy)
+
+    if proxies and not valid_proxies:
+        logging.error("No valid proxy entries remain after validation.")
+
+    return valid_proxies
 
 def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True, backoff='linear'):
     headers = {
@@ -1121,10 +1164,8 @@ def main():
         if proxy_list:
             logging.info(f"Loaded {len(proxy_list)} proxies from {proxy_path}")
         else:
-            logging.warning(f"No valid proxies loaded from {proxy_path}")
-            if args.test_geoblock:
-                logging.error("Cannot test geoblocks without valid proxies. Disabling geoblock testing.")
-                args.test_geoblock = False
+            logging.error(f"No valid proxies loaded from {proxy_path}. Aborting.")
+            return
 
     playlist_input = os.path.expanduser(args.playlist)
     playlists = []
