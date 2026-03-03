@@ -15,7 +15,7 @@ IPTV Stream Checker is a command-line tool designed to check the status of chann
 - **Capture Screenshots:** Capture screenshots from live streams.
 - **Group Filter:** Option to check specific groups within the M3U8 playlist.
 - **Detailed Stream Info:** Retrieve and display video codec, resolution, framerate, and audio bitrate.
-- **Low Framerate Detection:** Identifies and lists channels with framerates at 30fps or below.
+- **Low Framerate Detection:** Identifies and lists channels with framerates below 29fps.
 - **Mislabeled Channel Detection:** Detects channels with resolutions that do not match their labels (e.g., "1080p" labeled as "4K").
 - **Average Video Bitrate (optional):** When enabled, profiles each alive stream for 10 seconds with ffmpeg to estimate the average video bitrate.
 - **Regex Channel Filter:** Filter channels with a case-insensitive regular expression, even across multiple playlists.
@@ -150,7 +150,7 @@ MyPlaylist.m3u| 3/5 ✕ Dead Channel |
 
 ### Low Framerate Channels
 
-After processing, the script lists any channels with framerates of 30fps or below:
+After processing, the script lists any channels with framerates below 29fps:
 
 ```bash
 Low Framerate Channels:

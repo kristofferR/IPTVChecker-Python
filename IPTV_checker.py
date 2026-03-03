@@ -1142,7 +1142,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
                             if status == 'Alive' and ffprobe_available:
                                 mismatches = check_label_mismatch(channel_name, resolution)
-                                if fps is not None and fps <= 30:
+                                if fps is not None and fps < 29:
                                     low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
                                 if mismatches:
                                     mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
