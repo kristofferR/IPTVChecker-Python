@@ -222,6 +222,7 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
     playlist_segment_threshold = 1024 * 128  # Smaller threshold for HLS media segments
     max_playlist_depth = 4
     initial_timeout = 5
+    retryable_http_statuses = {408, 425, 429, 500, 502, 503, 504}
     geoblock_statuses = {403, 451, 426}
     secondary_geoblock_statuses = {401, 423, 451}
 
@@ -409,8 +410,8 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                 timeout=(initial_timeout, current_timeout),
                 headers=headers
             ) as resp:
-                if resp.status_code == 429:
-                    logging.debug("Rate limit exceeded, retrying...")
+                if resp.status_code in retryable_http_statuses:
+                    logging.debug(f"Retryable HTTP status {resp.status_code} for {target_url}, retrying...")
                     return 'Retry', None
                 if resp.status_code in geoblock_statuses:
                     logging.debug(f"Potential geoblock detected: HTTP {resp.status_code}")
