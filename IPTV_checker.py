@@ -968,23 +968,29 @@ def extract_resume_identifier(entry_text):
 
 def load_processed_channels(log_file):
     processed_channels = set()
+    processed_channel_indices = {}
     last_index = 0
     if os.path.exists(log_file):
         with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 parts = line.rstrip('\n').split(' - ', 1)
                 if len(parts) > 1:
+                    parsed_index = None
                     index_source = parts[0].strip()
                     if index_source:
                         index_tokens = index_source.split()
                         if index_tokens:
                             index_part = index_tokens[0]
                             if index_part.isdigit():
-                                last_index = max(last_index, int(index_part))
+                                parsed_index = int(index_part)
+                                last_index = max(last_index, parsed_index)
                     resume_identifier = extract_resume_identifier(parts[1].strip())
                     if resume_identifier:
                         processed_channels.add(resume_identifier)
-    return processed_channels, last_index
+                        if parsed_index is not None:
+                            previous_index = processed_channel_indices.get(resume_identifier, 0)
+                            processed_channel_indices[resume_identifier] = max(previous_index, parsed_index)
+    return processed_channels, last_index, processed_channel_indices
 
 def write_log_entry(log_file, entry):
     with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
@@ -1125,8 +1131,14 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                 output_folder = None
 
         log_file = os.path.join(playlist_dir, f"{base_playlist_name}_{group_suffix}_checklog.txt")
-        processed_channels, last_index = load_processed_channels(log_file)
+        processed_channels, last_index, processed_channel_indices = load_processed_channels(log_file)
+        try:
+            with open(log_file, 'w', encoding='utf-8', errors='replace'):
+                pass
+        except OSError as exc:
+            logging.error(f"Failed to truncate resume log '{log_file}': {exc}")
         current_channel = last_index
+        written_resume_entries = set()
         working_channels = []
         dead_channels = []
         geoblocked_channels = []
@@ -1161,6 +1173,12 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         pending_channel_name = None
         pending_metadata_lines = []
         pending_selected = False
+
+        def write_resume_entry(identifier, channel_index):
+            if not identifier or identifier in written_resume_entries:
+                return
+            write_log_entry(log_file, f"{channel_index} - {identifier}")
+            written_resume_entries.add(identifier)
 
         def append_pending_entry(extinf_line, metadata_lines, stream_line=None):
             if renamed_lines is None:
@@ -1300,10 +1318,16 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
                             console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
                             processed_channels.add(identifier)
-                            write_log_entry(log_file, f"{current_channel} - {stream_line}")
+                            processed_channel_indices[identifier] = current_channel
+                            write_resume_entry(identifier, current_channel)
                             file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
                         else:
                             logging.debug(f"Skipping previously processed channel: {channel_name}")
+                            resume_index = processed_channel_indices.get(identifier)
+                            if resume_index is None:
+                                resume_index = max(1, current_channel)
+                                processed_channel_indices[identifier] = resume_index
+                            write_resume_entry(identifier, resume_index)
 
                     append_pending_entry(output_extinf_line, channel_metadata_lines, stream_line)
                     pending_extinf = None
