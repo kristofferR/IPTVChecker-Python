@@ -956,6 +956,16 @@ def compile_channel_pattern(channel_search):
     except re.error as exc:
         raise ValueError(f"Invalid channel search regex '{channel_search}': {exc}") from exc
 
+def extract_resume_identifier(entry_text):
+    if not entry_text:
+        return ""
+    text = entry_text.strip()
+    if '://' in text:
+        for token in reversed(text.split()):
+            if '://' in token:
+                return token.strip()
+    return text
+
 def load_processed_channels(log_file):
     processed_channels = set()
     last_index = 0
@@ -971,7 +981,9 @@ def load_processed_channels(log_file):
                             index_part = index_tokens[0]
                             if index_part.isdigit():
                                 last_index = max(last_index, int(index_part))
-                    processed_channels.add(parts[1].strip())
+                    resume_identifier = extract_resume_identifier(parts[1].strip())
+                    if resume_identifier:
+                        processed_channels.add(resume_identifier)
     return processed_channels, last_index
 
 def write_log_entry(log_file, entry):
@@ -1194,7 +1206,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     channel_metadata_lines = pending_metadata_lines
 
                     if pending_selected:
-                        identifier = f"{channel_name} {stream_line}"
+                        identifier = stream_line
                         if identifier not in processed_channels:
                             current_channel += 1
                             cached_result = url_result_cache.get(stream_line)
@@ -1288,7 +1300,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
                             console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
                             processed_channels.add(identifier)
-                            write_log_entry(log_file, f"{current_channel} - {identifier}")
+                            write_log_entry(log_file, f"{current_channel} - {stream_line}")
                             file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
                         else:
                             logging.debug(f"Skipping previously processed channel: {channel_name}")
