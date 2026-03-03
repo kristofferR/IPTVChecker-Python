@@ -214,7 +214,7 @@ def load_proxy_list(proxy_file):
     
     return proxies
 
-def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True):
+def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True, backoff='linear'):
     headers = {
         'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
@@ -225,6 +225,10 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
     retryable_http_statuses = {408, 425, 429, 500, 502, 503, 504}
     geoblock_statuses = {403, 451, 426}
     secondary_geoblock_statuses = {401, 423, 451}
+    backoff_mode = (backoff or 'linear').strip().lower()
+    if backoff_mode not in {'none', 'linear', 'exponential'}:
+        logging.warning(f"Unknown backoff mode '{backoff_mode}', defaulting to linear.")
+        backoff_mode = 'linear'
 
     def is_playlist(content_type, target_url):
         lowered_type = content_type.lower()
@@ -455,6 +459,13 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         logging.debug(f"Following playlist entry: {next_url}")
         return verify(next_url, current_timeout, depth + 1, visited)
 
+    def get_retry_delay(attempt_index):
+        if backoff_mode == 'none':
+            return 0
+        if backoff_mode == 'exponential':
+            return min(2 ** attempt_index, 30)
+        return min(attempt_index + 1, 10)
+
     def attempt_check(current_timeout):
         for attempt in range(retries):
             visited = set()
@@ -462,7 +473,10 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             if status == 'Retry':
                 logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{retries})")
                 if attempt + 1 < max(1, retries):
-                    time.sleep(min(2 + attempt, 5))
+                    delay_seconds = get_retry_delay(attempt)
+                    if delay_seconds > 0:
+                        logging.debug(f"Applying {backoff_mode} backoff delay of {delay_seconds}s")
+                        time.sleep(delay_seconds)
                 continue
             return status, stream_url
         logging.error("Maximum retries exceeded for checking channel status")
@@ -792,7 +806,7 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True):
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear'):
     if not playlists:
         logging.error("No playlists to process.")
         return
@@ -893,7 +907,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                             extended_timeout=extended_timeout,
                             proxy_list=proxy_list,
                             test_geoblock=test_geoblock,
-                            ffmpeg_available=ffmpeg_available
+                            ffmpeg_available=ffmpeg_available,
+                            backoff=backoff
                         )
                         video_info = "Unknown"
                         audio_info = "Unknown"
@@ -1038,6 +1053,7 @@ def main():
     parser.add_argument("-channel_search", "-c", type=str, default=None, help="Regex used to filter channels by name (case-insensitive)")
     parser.add_argument("-skip_screenshots", action="store_true", help="Skip capturing screenshots for alive channels")
     parser.add_argument("--profile-bitrate", "-b", action="store_true", help="Profile average video bitrate (slower, uses a 10-second ffmpeg sample)")
+    parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"], default="linear", help="Retry backoff strategy: none, linear (1s,2s,3s...), exponential (1s,2s,4s...)")
 
     args = parser.parse_args()
 
@@ -1111,7 +1127,8 @@ def main():
         test_geoblock=args.test_geoblock,
         profile_bitrate=args.profile_bitrate,
         ffmpeg_available=ffmpeg_available,
-        ffprobe_available=ffprobe_available
+        ffprobe_available=ffprobe_available,
+        backoff=args.backoff
     )
 
 if __name__ == "__main__":

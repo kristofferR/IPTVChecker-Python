@@ -59,6 +59,7 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
 - **`-group` or `-g`**: Specify a group title to check within the playlist.
 - **`-timeout` or `-t`**: Set a timeout in seconds for checking the channel status.
 - **`-extended` or `-e [seconds]`**: Enable an extended timeout check for channels detected as dead. If specified without a value, defaults to 10 seconds. This option allows you to retry dead channels with a longer timeout.
+- **`--backoff` or `-B`**: Retry backoff strategy for transient failures (`none`, `linear`, or `exponential`). Default is `linear`.
 - **`-split` or `-s`**: Create separate playlists for working, dead, and geoblocked channels.
 - **`-rename` or `-r`**: Rename alive channels to include video and audio information in the playlist.
 - **`-proxy-list` or `-p`**: Path to proxy list file for geoblock testing.
@@ -131,6 +132,10 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
 13. **Enable Average Bitrate Profiling When Needed**:
     ```bash
     python IPTV_checker.py /path/to/your/playlist.m3u8 -b
+    ```
+14. **Use Exponential Retry Backoff**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 --backoff exponential
     ```
    
 ### Output Format
