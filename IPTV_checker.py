@@ -13,6 +13,8 @@ import codecs
 import re
 from urllib.parse import urljoin, urlparse
 
+ACTIVE_SUBPROCESSES = set()
+
 def print_header():
     header_text = """
 \033[96m██╗██████╗ ████████╗██╗   ██╗     ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗██████╗   
@@ -35,9 +37,65 @@ def setup_logging(verbose_level):
     else:
         logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def terminate_process(process):
+    if process is None:
+        return
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == 'nt':
+            process.terminate()
+        else:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except Exception:
+        pass
+
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == 'nt':
+                process.kill()
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+def cleanup_active_subprocesses():
+    for process in list(ACTIVE_SUBPROCESSES):
+        terminate_process(process)
+        ACTIVE_SUBPROCESSES.discard(process)
+
+def run_managed_subprocess(command, timeout):
+    popen_kwargs = {
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE
+    }
+    if os.name == 'nt':
+        creation_flag = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+        if creation_flag:
+            popen_kwargs['creationflags'] = creation_flag
+    else:
+        popen_kwargs['preexec_fn'] = os.setsid
+
+    process = None
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+        ACTIVE_SUBPROCESSES.add(process)
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if process is not None:
+            terminate_process(process)
+        raise
+    finally:
+        if process is not None:
+            ACTIVE_SUBPROCESSES.discard(process)
+
 def handle_sigint(signum, frame):
     logging.info("Interrupt received, stopping...")
-    sys.exit(0)
+    cleanup_active_subprocesses()
+    sys.exit(130)
 
 signal.signal(signal.SIGINT, handle_sigint)
 
@@ -60,12 +118,7 @@ def get_video_bitrate(url):
         '-'
     ]
     try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20
-        )
+        result = run_managed_subprocess(command, timeout=20)
         output = result.stderr.decode(errors='ignore')
         total_bytes = 0
         for line in output.splitlines():
@@ -98,12 +151,7 @@ def check_ffmpeg_availability():
     for tool in ['ffmpeg', 'ffprobe']:
         available = False
         try:
-            result = subprocess.run(
-                [tool, '-version'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=5
-            )
+            result = run_managed_subprocess([tool, '-version'], timeout=5)
             if result.returncode == 0:
                 logging.debug(f"{tool} is available")
                 available = True
@@ -550,7 +598,7 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             command = [
                 'ffmpeg', '-user_agent', headers['User-Agent'], '-i', verification_url, '-t', '5', '-f', 'null', '-'
             ]
-            ffmpeg_result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            ffmpeg_result = run_managed_subprocess(command, timeout=15)
             if ffmpeg_result.returncode != 0:
                 logging.warning(f"ffmpeg failed to read stream ({verification_url}); continuing with HTTP validation result")
         except FileNotFoundError:
@@ -569,7 +617,7 @@ def capture_frame(url, output_path, file_name):
         os.path.join(output_path, f"{file_name}.png")
     ]
     try:
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        run_managed_subprocess(command, timeout=30)
         logging.debug(f"Screenshot saved for {file_name}")
         return True
     except FileNotFoundError:
@@ -588,7 +636,7 @@ def get_detailed_stream_info(url, profile_bitrate=False):
         'stream=codec_name,width,height,r_frame_rate', '-of', 'json', url
     ]
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        result = run_managed_subprocess(command, timeout=10)
         output = result.stdout.decode(errors='ignore')
         codec_name = "Unknown"
         width = height = 0
@@ -677,7 +725,7 @@ def get_audio_bitrate(url):
         'stream=codec_name,bit_rate', '-of', 'default=noprint_wrappers=1', url
     ]
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        result = run_managed_subprocess(command, timeout=10)
         output = result.stdout.decode()
         audio_bitrate = None
         codec_name = None
