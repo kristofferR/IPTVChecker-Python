@@ -584,26 +584,36 @@ def capture_frame(url, output_path, file_name):
 
 def get_detailed_stream_info(url, profile_bitrate=False):
     command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 
-        'stream=codec_name,width,height,r_frame_rate', '-of', 'default=noprint_wrappers=1', url
+        'ffprobe', '-v', 'error', '-select_streams', 'v', '-show_entries',
+        'stream=codec_name,width,height,r_frame_rate', '-of', 'json', url
     ]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-        output = result.stdout.decode()
-        codec_name = None
-        width = height = None
+        output = result.stdout.decode(errors='ignore')
+        codec_name = "Unknown"
+        width = height = 0
         fps = None
-        for line in output.splitlines():
-            if line.startswith("codec_name="):
-                codec_name = line.split('=')[1].upper()
-            elif line.startswith("width="):
-                width = int(line.split('=')[1])
-            elif line.startswith("height="):
-                height = int(line.split('=')[1])
-            elif line.startswith("r_frame_rate="):
-                fps_data = line.split('=')[1]
-                if not fps_data:
-                    continue
+        probe_data = json.loads(output) if output else {}
+        streams = probe_data.get('streams', []) if isinstance(probe_data, dict) else []
+
+        selected_stream = None
+        selected_pixels = -1
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            stream_width = int(stream.get('width') or 0)
+            stream_height = int(stream.get('height') or 0)
+            pixel_count = stream_width * stream_height
+            if pixel_count > selected_pixels:
+                selected_pixels = pixel_count
+                selected_stream = stream
+
+        if selected_stream:
+            codec_name = (selected_stream.get('codec_name') or "Unknown").upper()
+            width = int(selected_stream.get('width') or 0)
+            height = int(selected_stream.get('height') or 0)
+            fps_data = selected_stream.get('r_frame_rate')
+            if fps_data:
                 try:
                     if '/' in fps_data:
                         numerator_str, denominator_str = fps_data.split('/', 1)
@@ -618,7 +628,7 @@ def get_detailed_stream_info(url, profile_bitrate=False):
 
         # Determine resolution string with FPS
         resolution = "Unknown"
-        if width and height:
+        if width > 0 and height > 0:
             if width >= 3840 and height >= 2160:
                 resolution = "4K"
             elif width >= 1920 and height >= 1080:
@@ -630,7 +640,7 @@ def get_detailed_stream_info(url, profile_bitrate=False):
 
         video_bitrate = get_video_bitrate(url) if profile_bitrate else "N/A"
 
-        return codec_name or "Unknown", video_bitrate, resolution, fps
+        return codec_name, video_bitrate, resolution, fps
     except FileNotFoundError:
         logging.error(f"ffprobe not found. Please install ffprobe to get stream info.")
         return "Unknown", "Unknown", "Unknown", None
