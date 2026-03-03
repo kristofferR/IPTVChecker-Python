@@ -1001,9 +1001,16 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         dead_channels = []
         geoblocked_channels = []
 
+        total_channels = 0
+        max_name_length = 0
         try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                lines = [line.strip() for line in file.readlines()]
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                for raw_line in file:
+                    line = raw_line.strip()
+                    if is_line_needed(line, group_title, pattern):
+                        total_channels += 1
+                        channel_name = get_channel_name(line)
+                        max_name_length = max(max_name_length, len(channel_name))
         except FileNotFoundError:
             logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
             continue
@@ -1014,136 +1021,179 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
             logging.error(f"Failed to read M3U file '{file_path}': {exc}")
             continue
 
-        channels = [line for line in lines if is_line_needed(line, group_title, pattern)]
-        total_channels = len(channels)
         logging.info(f"{playlist_file}: Total channels matching selection: {total_channels}\n")
-
-        max_name_length = 0
-        for channel_line in channels:
-            channel_name = get_channel_name(channel_line)
-            max_name_length = max(max_name_length, len(channel_name))
 
         max_line_length = max_name_length + len("1/5 ✓ | Video: 1080p50 H264 - Audio: 160 kbps AAC") + 3
         use_padding = max_line_length <= console_width
 
-        renamed_lines = []
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if is_line_needed(line, group_title, pattern):
-                channel_name = get_channel_name(line)
-                stream_line, channel_metadata_lines, channel_end_index = get_channel_stream_entry(lines, i)
-                if stream_line:
-                    identifier = f"{channel_name} {stream_line}"
-                    if identifier not in processed_channels:
-                        current_channel += 1
-                        cached_result = url_result_cache.get(stream_line)
-                        if cached_result:
-                            logging.debug(f"Reusing cached check result for duplicate URL: {stream_line}")
-                            status = cached_result['status']
-                            stream_url = cached_result['stream_url']
-                            target_url = cached_result.get('target_url')
-                            video_info = cached_result['video_info']
-                            audio_info = cached_result['audio_info']
-                            codec_name = cached_result['codec_name']
-                            video_bitrate = cached_result['video_bitrate']
-                            resolution = cached_result['resolution']
-                            fps = cached_result['fps']
+        renamed_lines = [] if rename else None
+        pending_extinf = None
+        pending_channel_name = None
+        pending_metadata_lines = []
+        pending_selected = False
+
+        def append_pending_entry(extinf_line, metadata_lines, stream_line=None):
+            if renamed_lines is None:
+                return
+            renamed_lines.append(extinf_line)
+            renamed_lines.extend(metadata_lines)
+            if stream_line is not None:
+                renamed_lines.append(stream_line)
+
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                for raw_line in file:
+                    line = raw_line.strip()
+
+                    if pending_extinf is None:
+                        if line.startswith('#EXTINF'):
+                            pending_extinf = line
+                            pending_channel_name = get_channel_name(line)
+                            pending_selected = is_line_needed(line, group_title, pattern)
+                            pending_metadata_lines = []
                         else:
-                            status, stream_url = check_channel_status(
-                                stream_line,
-                                timeout,
-                                extended_timeout=extended_timeout,
-                                proxy_list=proxy_list,
-                                test_geoblock=test_geoblock,
-                                ffmpeg_available=ffmpeg_available,
-                                backoff=backoff
-                            )
-                            target_url = stream_url or stream_line if status == 'Alive' else None
+                            if renamed_lines is not None:
+                                renamed_lines.append(line)
+                        continue
+
+                    if line.startswith('#EXTINF'):
+                        if pending_selected:
+                            logging.warning(f"No stream URL found for channel '{pending_channel_name}' in {playlist_file}")
+                        append_pending_entry(pending_extinf, pending_metadata_lines)
+                        pending_extinf = line
+                        pending_channel_name = get_channel_name(line)
+                        pending_selected = is_line_needed(line, group_title, pattern)
+                        pending_metadata_lines = []
+                        continue
+
+                    if not line or line.startswith('#'):
+                        pending_metadata_lines.append(line)
+                        continue
+
+                    stream_line = line
+                    output_extinf_line = pending_extinf
+                    channel_name = pending_channel_name
+                    channel_metadata_lines = pending_metadata_lines
+
+                    if pending_selected:
+                        identifier = f"{channel_name} {stream_line}"
+                        if identifier not in processed_channels:
+                            current_channel += 1
+                            cached_result = url_result_cache.get(stream_line)
+                            if cached_result:
+                                logging.debug(f"Reusing cached check result for duplicate URL: {stream_line}")
+                                status = cached_result['status']
+                                stream_url = cached_result['stream_url']
+                                target_url = cached_result.get('target_url')
+                                video_info = cached_result['video_info']
+                                audio_info = cached_result['audio_info']
+                                codec_name = cached_result['codec_name']
+                                video_bitrate = cached_result['video_bitrate']
+                                resolution = cached_result['resolution']
+                                fps = cached_result['fps']
+                            else:
+                                status, stream_url = check_channel_status(
+                                    stream_line,
+                                    timeout,
+                                    extended_timeout=extended_timeout,
+                                    proxy_list=proxy_list,
+                                    test_geoblock=test_geoblock,
+                                    ffmpeg_available=ffmpeg_available,
+                                    backoff=backoff
+                                )
+                                target_url = stream_url or stream_line if status == 'Alive' else None
+                                video_info = "Unknown"
+                                audio_info = "Unknown"
+                                codec_name = "Unknown"
+                                video_bitrate = "Unknown"
+                                resolution = "Unknown"
+                                fps = None
+                                if status == 'Alive' and ffprobe_available and target_url:
+                                    codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
+                                        target_url,
+                                        profile_bitrate=profile_bitrate and ffmpeg_available
+                                    )
+                                    video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
+                                    audio_info = get_audio_bitrate(target_url)
+                                url_result_cache[stream_line] = {
+                                    'status': status,
+                                    'stream_url': stream_url,
+                                    'target_url': target_url,
+                                    'video_info': video_info,
+                                    'audio_info': audio_info,
+                                    'codec_name': codec_name,
+                                    'video_bitrate': video_bitrate,
+                                    'resolution': resolution,
+                                    'fps': fps
+                                }
+
+                            if status == 'Alive' and ffprobe_available:
+                                mismatches = check_label_mismatch(channel_name, resolution)
+                                if fps is not None and fps <= 30:
+                                    low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
+                                if mismatches:
+                                    mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+
+                            channel_id = get_channel_id(stream_line)
+                            group_value = get_group_name(pending_extinf)
                             video_info = "Unknown"
                             audio_info = "Unknown"
-                            codec_name = "Unknown"
-                            video_bitrate = "Unknown"
-                            resolution = "Unknown"
-                            fps = None
-                            if status == 'Alive' and ffprobe_available and target_url:
-                                codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
-                                    target_url,
-                                    profile_bitrate=profile_bitrate and ffmpeg_available
-                                )
-                                video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
-                                audio_info = get_audio_bitrate(target_url)
-                            url_result_cache[stream_line] = {
-                                'status': status,
-                                'stream_url': stream_url,
-                                'target_url': target_url,
-                                'video_info': video_info,
-                                'audio_info': audio_info,
-                                'codec_name': codec_name,
-                                'video_bitrate': video_bitrate,
-                                'resolution': resolution,
-                                'fps': fps
-                            }
+                            if cached_result:
+                                video_info = cached_result['video_info']
+                                audio_info = cached_result['audio_info']
+                            elif status == 'Alive':
+                                video_info = url_result_cache[stream_line]['video_info']
+                                audio_info = url_result_cache[stream_line]['audio_info']
 
-                        if status == 'Alive' and ffprobe_available:
-                            mismatches = check_label_mismatch(channel_name, resolution)
-                            if fps is not None and fps <= 30:
-                                low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
-                            if mismatches:
-                                mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+                            if status == 'Alive':
+                                if not skip_screenshots and output_folder and ffmpeg_available:
+                                    file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
+                                    target_url = target_url or stream_line
+                                    capture_frame(target_url, output_folder, file_name)
 
-                        channel_id = get_channel_id(stream_line)
-                        group_value = get_group_name(line)
-                        video_info = "Unknown"
-                        audio_info = "Unknown"
-                        if cached_result:
-                            video_info = cached_result['video_info']
-                            audio_info = cached_result['audio_info']
-                        elif status == 'Alive':
-                            video_info = url_result_cache[stream_line]['video_info']
-                            audio_info = url_result_cache[stream_line]['audio_info']
+                                if rename:
+                                    renamed_channel_name = f"{channel_name} ({video_info} | Audio: {audio_info})"
+                                    extinf_parts = pending_extinf.split(',', 1)
+                                    if len(extinf_parts) > 1:
+                                        extinf_parts[1] = renamed_channel_name
+                                        output_extinf_line = ','.join(extinf_parts)
 
-                        if status == 'Alive':
-                            if not skip_screenshots and output_folder and ffmpeg_available:
-                                file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
-                                target_url = target_url or stream_line
-                                capture_frame(target_url, output_folder, file_name)
+                                if split:
+                                    working_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
+                            elif 'Geoblocked' in status:
+                                if split:
+                                    geoblocked_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
+                                geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+                            else:
+                                if split:
+                                    dead_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
 
-                            if rename:
-                                renamed_channel_name = f"{channel_name} ({video_info} | Audio: {audio_info})"
-                                extinf_parts = line.split(',', 1)
-                                if len(extinf_parts) > 1:
-                                    extinf_parts[1] = renamed_channel_name
-                                    line = ','.join(extinf_parts)
-
-                            if split:
-                                working_channels.append([line, *channel_metadata_lines, stream_line])
-                        elif 'Geoblocked' in status:
-                            if split:
-                                geoblocked_channels.append([line, *channel_metadata_lines, stream_line])
-                            geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+                            console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
+                            processed_channels.add(identifier)
+                            write_log_entry(log_file, f"{current_channel} - {identifier}")
+                            file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
                         else:
-                            if split:
-                                dead_channels.append([line, *channel_metadata_lines, stream_line])
+                            logging.debug(f"Skipping previously processed channel: {channel_name}")
 
-                        console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
-                        processed_channels.add(identifier)
-                        write_log_entry(log_file, f"{current_channel} - {identifier}")
-                        file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
-                    else:
-                        logging.debug(f"Skipping previously processed channel: {channel_name}")
+                    append_pending_entry(output_extinf_line, channel_metadata_lines, stream_line)
+                    pending_extinf = None
+                    pending_channel_name = None
+                    pending_selected = False
+                    pending_metadata_lines = []
+        except FileNotFoundError:
+            logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
+            continue
+        except PermissionError:
+            logging.error(f"Permission denied: Cannot read M3U file '{file_path}'")
+            continue
+        except Exception as exc:
+            logging.error(f"Failed to parse M3U file '{file_path}': {exc}")
+            continue
 
-                    renamed_lines.append(line)
-                    renamed_lines.extend(channel_metadata_lines)
-                    renamed_lines.append(stream_line)
-                else:
-                    logging.warning(f"No stream URL found for channel '{channel_name}' in {playlist_file}")
-                    renamed_lines.append(line)
-                    renamed_lines.extend(channel_metadata_lines)
-                i = max(i, channel_end_index)
-            else:
-                renamed_lines.append(line)
-            i += 1
+        if pending_extinf is not None:
+            if pending_selected:
+                logging.warning(f"No stream URL found for channel '{pending_channel_name}' in {playlist_file}")
+            append_pending_entry(pending_extinf, pending_metadata_lines)
 
         if split:
             working_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_working.m3u8")
