@@ -825,6 +825,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
     low_framerate_channels = []
     mislabeled_channels = []
     geoblocked_summary = {}
+    url_result_cache = {}
 
     f_output = None
     if output_file:
@@ -901,40 +902,76 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     identifier = f"{channel_name} {stream_line}"
                     if identifier not in processed_channels:
                         current_channel += 1
-                        status, stream_url = check_channel_status(
-                            stream_line,
-                            timeout,
-                            extended_timeout=extended_timeout,
-                            proxy_list=proxy_list,
-                            test_geoblock=test_geoblock,
-                            ffmpeg_available=ffmpeg_available,
-                            backoff=backoff
-                        )
-                        video_info = "Unknown"
-                        audio_info = "Unknown"
-                        codec_name = "Unknown"
-                        video_bitrate = "Unknown"
-                        resolution = "Unknown"
-                        fps = None
-                        channel_id = get_channel_id(stream_line)
-                        group_value = get_group_name(line)
-
-                        if status == 'Alive':
-                            target_url = stream_url or stream_line
-                            if ffprobe_available:
+                        cached_result = url_result_cache.get(stream_line)
+                        if cached_result:
+                            logging.debug(f"Reusing cached check result for duplicate URL: {stream_line}")
+                            status = cached_result['status']
+                            stream_url = cached_result['stream_url']
+                            target_url = cached_result.get('target_url')
+                            video_info = cached_result['video_info']
+                            audio_info = cached_result['audio_info']
+                            codec_name = cached_result['codec_name']
+                            video_bitrate = cached_result['video_bitrate']
+                            resolution = cached_result['resolution']
+                            fps = cached_result['fps']
+                        else:
+                            status, stream_url = check_channel_status(
+                                stream_line,
+                                timeout,
+                                extended_timeout=extended_timeout,
+                                proxy_list=proxy_list,
+                                test_geoblock=test_geoblock,
+                                ffmpeg_available=ffmpeg_available,
+                                backoff=backoff
+                            )
+                            target_url = stream_url or stream_line if status == 'Alive' else None
+                            video_info = "Unknown"
+                            audio_info = "Unknown"
+                            codec_name = "Unknown"
+                            video_bitrate = "Unknown"
+                            resolution = "Unknown"
+                            fps = None
+                            if status == 'Alive' and ffprobe_available and target_url:
                                 codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
                                     target_url,
                                     profile_bitrate=profile_bitrate and ffmpeg_available
                                 )
                                 video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
                                 audio_info = get_audio_bitrate(target_url)
-                                mismatches = check_label_mismatch(channel_name, resolution)
-                                if fps is not None and fps <= 30:
-                                    low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
-                                if mismatches:
-                                    mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+                            url_result_cache[stream_line] = {
+                                'status': status,
+                                'stream_url': stream_url,
+                                'target_url': target_url,
+                                'video_info': video_info,
+                                'audio_info': audio_info,
+                                'codec_name': codec_name,
+                                'video_bitrate': video_bitrate,
+                                'resolution': resolution,
+                                'fps': fps
+                            }
+
+                        if status == 'Alive' and ffprobe_available:
+                            mismatches = check_label_mismatch(channel_name, resolution)
+                            if fps is not None and fps <= 30:
+                                low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
+                            if mismatches:
+                                mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
+
+                        channel_id = get_channel_id(stream_line)
+                        group_value = get_group_name(line)
+                        video_info = "Unknown"
+                        audio_info = "Unknown"
+                        if cached_result:
+                            video_info = cached_result['video_info']
+                            audio_info = cached_result['audio_info']
+                        elif status == 'Alive':
+                            video_info = url_result_cache[stream_line]['video_info']
+                            audio_info = url_result_cache[stream_line]['audio_info']
+
+                        if status == 'Alive':
                             if not skip_screenshots and output_folder and ffmpeg_available:
                                 file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
+                                target_url = target_url or stream_line
                                 capture_frame(target_url, output_folder, file_name)
 
                             if rename:
