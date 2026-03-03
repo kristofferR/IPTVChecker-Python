@@ -367,20 +367,15 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
 
     def read_stream(response, min_bytes):
         bytes_read = 0
-        stable_connection = True
         for chunk in response.iter_content(1024 * 128):  # 128KB chunks
             if not chunk:
-                stable_connection = False
-                break
+                continue
             bytes_read += len(chunk)
             if bytes_read >= min_bytes:
                 logging.debug(f"Data received: {bytes_read} bytes")
                 return 'Alive', response.url
 
         logging.debug(f"Data received: {bytes_read} bytes")
-        if not stable_connection:
-            logging.debug("Unstable connection detected")
-            return 'Dead', None
         if min_bytes >= min_data_threshold:
             fallback_threshold = min_bytes
         else:
