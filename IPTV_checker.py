@@ -10,6 +10,7 @@ import shutil
 import random
 import json
 import codecs
+import csv
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -945,21 +946,45 @@ def write_log_entry(log_file, entry):
     with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
         f.write(entry + "\n")
 
+def sanitize_csv_field(value):
+    if value is None:
+        return ""
+    normalized = str(value).replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+    check_value = normalized.lstrip()
+    if check_value.startswith(('=', '+', '-', '@')):
+        return "'" + normalized
+    return normalized
+
 def file_log_entry(f_output, playlist_file, current_channel, total_channels, group_name, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info):
     if f_output is None:
         return
-    safe_group = group_name.replace('"', '""') if group_name else ""
-    safe_channel = channel_name.replace('"', '""') if channel_name else ""
-    codec_field = codec_name if codec_name else "Unknown"
+    safe_playlist = sanitize_csv_field(playlist_file)
+    safe_status = sanitize_csv_field(status)
+    safe_group = sanitize_csv_field(group_name)
+    safe_channel = sanitize_csv_field(channel_name)
+    codec_field = sanitize_csv_field(codec_name if codec_name else "Unknown")
     bitrate_field = video_bitrate.replace("kbps", "").strip() if isinstance(video_bitrate, str) else video_bitrate
     if not bitrate_field:
         bitrate_field = "Unknown"
+    bitrate_field = sanitize_csv_field(bitrate_field)
+    resolution_field = sanitize_csv_field(resolution)
     fps_field = fps if fps is not None else ""
-    audio_field = audio_info.replace('"', '""') if audio_info else "Unknown"
-    channel_id_field = channel_id if channel_id else "Unknown"
-    f_output.write(
-        f"{playlist_file},{current_channel},{total_channels},{status},\"{safe_group}\",\"{safe_channel}\",{channel_id_field},{codec_field},{bitrate_field},{resolution},{fps_field},{audio_field}\n"
-    )
+    audio_field = sanitize_csv_field(audio_info if audio_info else "Unknown")
+    channel_id_field = sanitize_csv_field(channel_id if channel_id else "Unknown")
+    csv.writer(f_output, lineterminator='\n').writerow([
+        safe_playlist,
+        current_channel,
+        total_channels,
+        safe_status,
+        safe_group,
+        safe_channel,
+        channel_id_field,
+        codec_field,
+        bitrate_field,
+        resolution_field,
+        fps_field,
+        audio_field
+    ])
 
 def console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding):
     # Set colors and symbols based on status
