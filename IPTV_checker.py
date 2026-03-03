@@ -612,6 +612,38 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
 
     return status, stream_url
 
+def build_screenshot_filename(output_path, channel_index, channel_name, max_length=200):
+    illegal_chars_pattern = r'[\\/:*?"<>|]'
+    windows_reserved_names = {
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+    }
+
+    normalized_name = channel_name if channel_name else "channel"
+    normalized_name = re.sub(illegal_chars_pattern, '-', normalized_name)
+    normalized_name = normalized_name.strip().strip('.')
+    normalized_name = re.sub(r'\s+', ' ', normalized_name)
+    if not normalized_name:
+        normalized_name = "channel"
+
+    if normalized_name.upper() in windows_reserved_names:
+        normalized_name = f"{normalized_name}_channel"
+
+    base_prefix = f"{channel_index}-"
+    remaining_length = max(1, max_length - len(base_prefix))
+    base_name = normalized_name[:remaining_length]
+    candidate = f"{base_prefix}{base_name}"
+
+    suffix_index = 1
+    while os.path.exists(os.path.join(output_path, f"{candidate}.png")):
+        suffix = f"_{suffix_index}"
+        allowed_length = max(1, remaining_length - len(suffix))
+        candidate = f"{base_prefix}{base_name[:allowed_length]}{suffix}"
+        suffix_index += 1
+
+    return candidate
+
 def capture_frame(url, output_path, file_name):
     command = [
         'ffmpeg', '-y', '-i', url, '-ss', '00:00:02', '-frames:v', '1',
@@ -1233,7 +1265,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
                             if status == 'Alive':
                                 if not skip_screenshots and output_folder and ffmpeg_available:
-                                    file_name = f"{current_channel}-{channel_name.replace('/', '-')}"
+                                    file_name = build_screenshot_filename(output_folder, current_channel, channel_name)
                                     target_url = target_url or stream_line
                                     capture_frame(target_url, output_folder, file_name)
 
