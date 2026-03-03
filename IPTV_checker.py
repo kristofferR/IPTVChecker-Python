@@ -626,6 +626,9 @@ def get_detailed_stream_info(url, profile_bitrate=False):
                 except ValueError:
                     logging.debug(f"Unable to parse frame rate '{fps_data}' for {url}")
 
+        if fps is not None and fps <= 0:
+            fps = None
+
         # Determine resolution string with FPS
         resolution = "Unknown"
         if width > 0 and height > 0:
