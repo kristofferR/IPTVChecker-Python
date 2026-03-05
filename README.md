@@ -18,6 +18,7 @@ IPTV Stream Checker is a command-line tool designed to check the status of chann
 - **Low Framerate Detection:** Identifies and lists channels with framerates below 29fps.
 - **Mislabeled Channel Detection:** Detects channels with resolutions that do not match their labels (e.g., "1080p" labeled as "4K").
 - **Average Video Bitrate (optional):** When enabled, profiles each alive stream for 10 seconds with ffmpeg to estimate the average video bitrate.
+- **Concurrent Checking:** Check multiple channels simultaneously with configurable worker threads for significantly faster scans.
 - **Regex Channel Filter:** Filter channels with a case-insensitive regular expression, even across multiple playlists.
 - **CSV Reporting:** Export per-channel results (status, metadata, bitrate, audio) to a CSV file.
 - **Directory Support:** Point the tool at a directory to scan every M3U/M3U8 file it contains.
@@ -69,6 +70,7 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
 - **`-channel_search` or `-c`**: Only process channels whose names match a case-insensitive regular expression.
 - **`-skip_screenshots`**: Skip capturing screenshots for alive channels to speed up runs.
 - **`--profile-bitrate` or `-b`**: Profile average video bitrate with ffmpeg (adds roughly 10 seconds per channel).
+- **`--workers` or `-w`**: Number of concurrent workers for channel checking (`1` to `20`, default `4`). Higher values speed up scans for large playlists. Use `1` for sequential processing.
 - **`-v`**: Increase output verbosity to `INFO` level.
 - **`-vv`**: Increase output verbosity to `DEBUG` level.
 
@@ -138,7 +140,15 @@ python IPTV_checker.py /path/to/your/playlist.m3u8
     ```bash
     python IPTV_checker.py /path/to/your/playlist.m3u8 --backoff exponential
     ```
-   
+15. **Speed Up Large Playlists with More Workers**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 -w 10
+    ```
+16. **Sequential Processing (Single Worker)**:
+    ```bash
+    python IPTV_checker.py /path/to/your/playlist.m3u8 -w 1
+    ```
+
 ### Output Format
 
 The script will output the status of each channel in the following format:
