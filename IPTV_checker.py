@@ -679,7 +679,9 @@ def capture_frame(url, output_path, file_name):
 
 def get_detailed_stream_info(url, profile_bitrate=False):
     command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'v', '-show_entries',
+        'ffprobe', '-v', 'error',
+        '-analyzeduration', '15000000', '-probesize', '15000000',
+        '-select_streams', 'v', '-show_entries',
         'stream=codec_name,width,height,r_frame_rate', '-of', 'json', url
     ]
     try:
@@ -768,7 +770,9 @@ def format_stream_info(codec_name, video_bitrate, resolution, fps):
 
 def get_audio_bitrate(url):
     command = [
-        'ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries',
+        'ffprobe', '-v', 'error',
+        '-analyzeduration', '15000000', '-probesize', '15000000',
+        '-select_streams', 'a:0', '-show_entries',
         'stream=codec_name,bit_rate', '-of', 'default=noprint_wrappers=1', url
     ]
     try:
