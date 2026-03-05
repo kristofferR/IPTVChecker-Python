@@ -806,14 +806,14 @@ def check_label_mismatch(channel_name, resolution):
 
     mismatches = []
 
-    # Compare resolution ignoring the framerate part
-    if "4k" in channel_name_lower or "uhd" in channel_name_lower:
+    # Compare resolution ignoring the framerate part (word-boundary matching)
+    if re.search(r'\b4k\b', channel_name_lower) or re.search(r'\buhd\b', channel_name_lower):
         if resolution != "4K":
             mismatches.append(f"\033[91mExpected 4K, got {resolution}\033[0m")
-    elif "1080p" in channel_name_lower or "fhd" in channel_name_lower:
+    elif re.search(r'\b1080p\b', channel_name_lower) or re.search(r'\bfhd\b', channel_name_lower):
         if resolution != "1080p":
             mismatches.append(f"\033[91mExpected 1080p, got {resolution}\033[0m")
-    elif "hd" in channel_name_lower:
+    elif re.search(r'\bhd\b', channel_name_lower):
         if resolution not in ["1080p", "720p"]:
             mismatches.append(f"\033[91mExpected 720p or 1080p, got {resolution}\033[0m")
     elif resolution == "4K":
