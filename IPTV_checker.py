@@ -1190,13 +1190,17 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6, workers=4):
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6, workers=4, insecure=False):
     if not playlists:
         logging.error("No playlists to process.")
         return
 
     session = requests.Session()
     session.headers.update({'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'})
+    if insecure:
+        session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     adapter = HTTPAdapter(pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -1651,6 +1655,7 @@ def main():
     parser.add_argument("--profile-bitrate", "-b", action="store_true", help="Profile average video bitrate (slower, uses a 10-second ffmpeg sample)")
     parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"], default="linear", help="Retry backoff strategy: none, linear (1s,2s,3s...), exponential (1s,2s,4s...)")
     parser.add_argument("--workers", "-w", type=int, default=4, help="Number of concurrent workers for channel checking (1-20, default: 4)")
+    parser.add_argument("--insecure", "-k", action="store_true", help="Disable SSL certificate verification for HTTPS streams")
 
     args = parser.parse_args()
 
@@ -1681,6 +1686,10 @@ def main():
         logging.error("Disabling args.profile_bitrate because ffmpeg_available is False.")
         print("\033[93mWarning: args.profile_bitrate disabled because ffmpeg_available is False.\033[0m")
         args.profile_bitrate = False
+
+    if args.insecure:
+        logging.warning("SSL certificate verification is disabled.")
+        print("\033[93mWarning: SSL certificate verification is disabled (--insecure).\033[0m")
 
     # Load proxy list if provided
     proxy_list = None
@@ -1734,7 +1743,8 @@ def main():
         ffprobe_available=ffprobe_available,
         backoff=args.backoff,
         retries=args.retries,
-        workers=args.workers
+        workers=args.workers,
+        insecure=args.insecure
     )
 
 if __name__ == "__main__":
