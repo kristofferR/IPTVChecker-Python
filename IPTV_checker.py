@@ -722,6 +722,23 @@ def get_detailed_stream_info(url, profile_bitrate=False):
                         fps = round(float(fps_data))
                 except ValueError:
                     logging.debug(f"Unable to parse frame rate '{fps_data}' for {url}")
+        else:
+            # No video streams found — check if audio-only
+            try:
+                audio_probe_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-analyzeduration', '15000000', '-probesize', '15000000',
+                    '-select_streams', 'a', '-show_entries', 'stream=codec_type',
+                    '-of', 'json', url
+                ]
+                audio_result = run_managed_subprocess(audio_probe_cmd, timeout=10)
+                audio_output = audio_result.stdout.decode(errors='ignore')
+                audio_data = json.loads(audio_output) if audio_output else {}
+                audio_streams = audio_data.get('streams', []) if isinstance(audio_data, dict) else []
+                if audio_streams:
+                    return "Audio Only", "N/A", "Audio Only", None
+            except Exception:
+                pass
 
         if fps is not None and fps <= 0:
             fps = None
