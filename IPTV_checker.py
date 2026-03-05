@@ -660,7 +660,7 @@ def build_screenshot_filename(output_path, channel_index, channel_name, max_leng
 
 def capture_frame(url, output_path, file_name):
     command = [
-        'ffmpeg', '-y', '-i', url, '-ss', '00:00:02', '-frames:v', '1',
+        'ffmpeg', '-y', '-i', url, '-frames:v', '1',
         os.path.join(output_path, f"{file_name}.png")
     ]
     try:
