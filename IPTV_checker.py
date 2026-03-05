@@ -14,8 +14,9 @@ import csv
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
-from dataclasses import dataclass, field
+import hashlib
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
 
 
@@ -1039,18 +1040,60 @@ def compile_channel_pattern(channel_search):
     except re.error as exc:
         raise ValueError(f"Invalid channel search regex '{channel_search}': {exc}") from exc
 
+# Query parameters commonly used for tracking/auth tokens that change between sessions
+_TRACKING_PARAMS = frozenset({
+    'token', 'auth', 'key', 'sig', 'signature', 'expires', 'expire',
+    'ts', 'timestamp', 'nonce', 'hash', 'h', 'tk', 'st', 'e',
+    'utid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_content',
+    'utm_term', 'fbclid', 'gclid', '_', 'cb', 'cachebuster', 'rand',
+})
+
+def normalize_url_for_hash(url):
+    """Normalize a URL for hashing by stripping tracking params and sorting query params."""
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        # Remove known tracking/session parameters
+        filtered = {k: sorted(v) for k, v in params.items() if k.lower() not in _TRACKING_PARAMS}
+        # Rebuild with sorted params for deterministic ordering
+        normalized_query = urlencode(filtered, doseq=True)
+        normalized = urlunparse((
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            parsed.params,
+            normalized_query,
+            '',  # strip fragment
+        ))
+        return normalized
+    except Exception:
+        return url
+
+def url_resume_hash(url):
+    """Compute a SHA-256 hash of the normalized URL for resume matching."""
+    normalized = normalize_url_for_hash(url)
+    return hashlib.sha256(normalized.encode('utf-8', errors='replace')).hexdigest()[:16]
+
 def extract_resume_identifier(entry_text):
+    """Extract hash and URL from a resume log entry. Returns (hash, url) or (None, raw_text)."""
     if not entry_text:
-        return ""
+        return None, ""
     text = entry_text.strip()
+    # New format: "hash|url"
+    if '|' in text:
+        parts = text.split('|', 1)
+        return parts[0].strip(), parts[1].strip()
+    # Legacy format: just the URL
     if '://' in text:
         for token in reversed(text.split()):
             if '://' in token:
-                return token.strip()
-    return text
+                return None, token.strip()
+    return None, text
 
 def load_processed_channels(log_file):
-    processed_channels = set()
+    """Load processed channels from resume log. Supports both hash|url and legacy URL formats."""
+    processed_hashes = set()
+    processed_urls = set()
     processed_channel_indices = {}
     last_index = 0
     if os.path.exists(log_file):
@@ -1067,13 +1110,18 @@ def load_processed_channels(log_file):
                             if index_part.isdigit():
                                 parsed_index = int(index_part)
                                 last_index = max(last_index, parsed_index)
-                    resume_identifier = extract_resume_identifier(parts[1].strip())
-                    if resume_identifier:
-                        processed_channels.add(resume_identifier)
+                    entry_hash, entry_url = extract_resume_identifier(parts[1].strip())
+                    if entry_hash:
+                        processed_hashes.add(entry_hash)
                         if parsed_index is not None:
-                            previous_index = processed_channel_indices.get(resume_identifier, 0)
-                            processed_channel_indices[resume_identifier] = max(previous_index, parsed_index)
-    return processed_channels, last_index, processed_channel_indices
+                            previous_index = processed_channel_indices.get(entry_hash, 0)
+                            processed_channel_indices[entry_hash] = max(previous_index, parsed_index)
+                    if entry_url:
+                        processed_urls.add(entry_url)
+                        if not entry_hash and parsed_index is not None:
+                            previous_index = processed_channel_indices.get(entry_url, 0)
+                            processed_channel_indices[entry_url] = max(previous_index, parsed_index)
+    return processed_hashes, processed_urls, last_index, processed_channel_indices
 
 def write_log_entry(log_file, entry):
     with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
@@ -1309,7 +1357,7 @@ def parse_m3u8_files(playlists, config):
                 output_folder = None
 
         log_file = os.path.join(playlist_dir, f"{base_playlist_name}_{group_suffix}_checklog.txt")
-        processed_channels, last_index, processed_channel_indices = load_processed_channels(log_file)
+        processed_hashes, processed_urls, last_index, processed_channel_indices = load_processed_channels(log_file)
         try:
             with open(log_file, 'w', encoding='utf-8', errors='replace'):
                 pass
@@ -1354,11 +1402,11 @@ def parse_m3u8_files(playlists, config):
         checkpoint_writer = CheckpointWriter(log_file)
         entries_to_check = []
 
-        def write_resume_entry(identifier, channel_index):
-            if not identifier or identifier in written_resume_entries:
+        def write_resume_entry(stream_hash, stream_url, channel_index):
+            if not stream_hash or stream_hash in written_resume_entries:
                 return
-            checkpoint_writer.write(f"{channel_index} - {identifier}")
-            written_resume_entries.add(identifier)
+            checkpoint_writer.write(f"{channel_index} - {stream_hash}|{stream_url}")
+            written_resume_entries.add(stream_hash)
 
         def append_pending_entry(extinf_line, metadata_lines, stream_line=None):
             if renamed_lines is None:
@@ -1404,8 +1452,9 @@ def parse_m3u8_files(playlists, config):
                     channel_metadata_lines = pending_metadata_lines
 
                     if pending_selected:
-                        identifier = stream_line
-                        if identifier not in processed_channels:
+                        stream_hash = url_resume_hash(stream_line)
+                        already_processed = stream_hash in processed_hashes or stream_line in processed_urls
+                        if not already_processed:
                             current_channel += 1
                             entry = {
                                 'channel_index': current_channel,
@@ -1420,15 +1469,15 @@ def parse_m3u8_files(playlists, config):
                             if renamed_lines is not None:
                                 entry['renamed_line_idx'] = len(renamed_lines)
                             entries_to_check.append(entry)
-                            processed_channels.add(identifier)
-                            processed_channel_indices[identifier] = current_channel
+                            processed_hashes.add(stream_hash)
+                            processed_channel_indices[stream_hash] = current_channel
                         else:
                             logging.debug(f"Skipping previously processed channel: {channel_name}")
-                            resume_index = processed_channel_indices.get(identifier)
+                            resume_index = processed_channel_indices.get(stream_hash) or processed_channel_indices.get(stream_line)
                             if resume_index is None:
                                 resume_index = max(1, current_channel)
-                                processed_channel_indices[identifier] = resume_index
-                            write_resume_entry(identifier, resume_index)
+                                processed_channel_indices[stream_hash] = resume_index
+                            write_resume_entry(stream_hash, stream_line, resume_index)
 
                     append_pending_entry(output_extinf_line, channel_metadata_lines, stream_line)
                     pending_extinf = None
@@ -1584,7 +1633,7 @@ def parse_m3u8_files(playlists, config):
                             error_reason=result.get('error_reason')
                         )
 
-                    write_resume_entry(check_entry['stream_line'], check_entry['channel_index'])
+                    write_resume_entry(url_resume_hash(check_entry['stream_line']), check_entry['stream_line'], check_entry['channel_index'])
             except KeyboardInterrupt:
                 cancel_event.set()
                 for pending in future_map:
