@@ -1042,6 +1042,33 @@ class CheckpointWriter:
     def close(self):
         self.flush()
 
+class UrlDeduplicator:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._results = {}
+        self._pending = {}
+
+    def get_or_start(self, url):
+        with self._lock:
+            if url in self._results:
+                return 'cached', self._results[url]
+            if url in self._pending:
+                return 'waiting', self._pending[url]
+            event = threading.Event()
+            self._pending[url] = event
+            return 'check', None
+
+    def set_result(self, url, result):
+        with self._lock:
+            self._results[url] = result
+            event = self._pending.pop(url, None)
+        if event:
+            event.set()
+
+    def get_result(self, url):
+        with self._lock:
+            return self._results.get(url)
+
 def sanitize_csv_field(value):
     if value is None:
         return ""
@@ -1148,7 +1175,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
     low_framerate_channels = []
     mislabeled_channels = []
     geoblocked_summary = {}
-    url_result_cache = {}
+    url_dedup = UrlDeduplicator()
 
     f_output = None
     if output_file:
@@ -1333,47 +1360,63 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
         def check_channel_worker(check_entry):
             s_line = check_entry['stream_line']
-            cached = url_result_cache.get(s_line)
-            if cached:
+            action, cached = url_dedup.get_or_start(s_line)
+            if action == 'cached':
                 logging.debug(f"Reusing cached check result for duplicate URL: {s_line}")
                 return cached
+            if action == 'waiting':
+                logging.debug(f"Waiting for in-progress check of duplicate URL: {s_line}")
+                cached.wait()
+                return url_dedup.get_result(s_line)
 
-            status, stream_url = check_channel_status(
-                s_line, timeout, retries=retries,
-                extended_timeout=extended_timeout,
-                proxy_list=proxy_list, test_geoblock=test_geoblock,
-                ffmpeg_available=ffmpeg_available, backoff=backoff,
-                session=session
-            )
+            result = None
+            try:
+                status, stream_url = check_channel_status(
+                    s_line, timeout, retries=retries,
+                    extended_timeout=extended_timeout,
+                    proxy_list=proxy_list, test_geoblock=test_geoblock,
+                    ffmpeg_available=ffmpeg_available, backoff=backoff,
+                    session=session
+                )
 
-            target_url = (stream_url or s_line) if status == 'Alive' else None
-            video_info = "Unknown"
-            audio_info = "Unknown"
-            codec_name = "Unknown"
-            video_bitrate = "Unknown"
-            resolution = "Unknown"
-            fps = None
+                target_url = (stream_url or s_line) if status == 'Alive' else None
+                video_info = "Unknown"
+                audio_info = "Unknown"
+                codec_name = "Unknown"
+                video_bitrate = "Unknown"
+                resolution = "Unknown"
+                fps = None
 
-            if status == 'Alive' and ffprobe_available and target_url:
-                with diag_semaphore:
-                    codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
-                        target_url, profile_bitrate=profile_bitrate and ffmpeg_available
-                    )
-                    video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
-                    audio_info = get_audio_bitrate(target_url)
+                if status == 'Alive' and ffprobe_available and target_url:
+                    with diag_semaphore:
+                        codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
+                            target_url, profile_bitrate=profile_bitrate and ffmpeg_available
+                        )
+                        video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
+                        audio_info = get_audio_bitrate(target_url)
 
-            if status == 'Alive' and not skip_screenshots and output_folder and ffmpeg_available:
-                with diag_semaphore:
-                    file_name = build_screenshot_filename(output_folder, check_entry['channel_index'], check_entry['channel_name'])
-                    capture_frame(target_url or s_line, output_folder, file_name)
+                if status == 'Alive' and not skip_screenshots and output_folder and ffmpeg_available:
+                    with diag_semaphore:
+                        file_name = build_screenshot_filename(output_folder, check_entry['channel_index'], check_entry['channel_name'])
+                        capture_frame(target_url or s_line, output_folder, file_name)
 
-            result = {
-                'status': status, 'stream_url': stream_url, 'target_url': target_url,
-                'video_info': video_info, 'audio_info': audio_info,
-                'codec_name': codec_name, 'video_bitrate': video_bitrate,
-                'resolution': resolution, 'fps': fps,
-            }
-            url_result_cache[s_line] = result
+                result = {
+                    'status': status, 'stream_url': stream_url, 'target_url': target_url,
+                    'video_info': video_info, 'audio_info': audio_info,
+                    'codec_name': codec_name, 'video_bitrate': video_bitrate,
+                    'resolution': resolution, 'fps': fps,
+                }
+            except Exception:
+                result = {
+                    'status': 'Dead', 'stream_url': None, 'target_url': None,
+                    'video_info': 'Unknown', 'audio_info': 'Unknown',
+                    'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
+                    'resolution': 'Unknown', 'fps': None,
+                }
+                raise
+            finally:
+                if result is not None:
+                    url_dedup.set_result(s_line, result)
             return result
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
