@@ -15,7 +15,32 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
+from dataclasses import dataclass, field
 from requests.adapters import HTTPAdapter
+
+
+@dataclass
+class ScanConfig:
+    """Configuration for an IPTV playlist scan."""
+    group_title: str | None = None
+    timeout: int = 15
+    extended_timeout: int | None = None
+    split: bool = False
+    rename: bool = False
+    skip_screenshots: bool = False
+    output_file: str | None = None
+    channel_search: str | None = None
+    channel_pattern: object | None = None
+    proxy_list: list | None = None
+    test_geoblock: bool = False
+    profile_bitrate: bool = False
+    ffmpeg_available: bool = True
+    ffprobe_available: bool = True
+    backoff: str = 'linear'
+    retries: int = 6
+    workers: int = 4
+    insecure: bool = False
+
 
 ACTIVE_SUBPROCESSES = set()
 _subprocess_lock = threading.Lock()
@@ -1200,10 +1225,29 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6, workers=4, insecure=False):
+def parse_m3u8_files(playlists, config):
     if not playlists:
         logging.error("No playlists to process.")
         return
+
+    group_title = config.group_title
+    timeout = config.timeout
+    extended_timeout = config.extended_timeout
+    split = config.split
+    rename = config.rename
+    skip_screenshots = config.skip_screenshots
+    output_file = config.output_file
+    channel_search = config.channel_search
+    channel_pattern = config.channel_pattern
+    proxy_list = config.proxy_list
+    test_geoblock = config.test_geoblock
+    profile_bitrate = config.profile_bitrate
+    ffmpeg_available = config.ffmpeg_available
+    ffprobe_available = config.ffprobe_available
+    backoff = config.backoff
+    retries = config.retries
+    workers = config.workers
+    insecure = config.insecure
 
     session = requests.Session()
     session.headers.update({'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'})
@@ -1749,10 +1793,9 @@ def main():
 
     output_file = os.path.expanduser(args.output) if args.output else None
 
-    parse_m3u8_files(
-        playlists,
-        args.group,
-        args.timeout,
+    config = ScanConfig(
+        group_title=args.group,
+        timeout=args.timeout,
         extended_timeout=args.extended,
         split=args.split,
         rename=args.rename,
@@ -1768,8 +1811,9 @@ def main():
         backoff=args.backoff,
         retries=args.retries,
         workers=args.workers,
-        insecure=args.insecure
+        insecure=args.insecure,
     )
+    parse_m3u8_files(playlists, config)
 
 if __name__ == "__main__":
     main()
