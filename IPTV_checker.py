@@ -13,6 +13,7 @@ import codecs
 import csv
 import re
 from urllib.parse import urljoin, urlparse
+from requests.adapters import HTTPAdapter
 
 ACTIVE_SUBPROCESSES = set()
 
@@ -306,7 +307,7 @@ def load_proxy_list(proxy_file):
 
     return valid_proxies
 
-def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True, backoff='linear'):
+def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True, backoff='linear', session=None):
     headers = {
         'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'
     }
@@ -494,8 +495,9 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         playlist_text = None
         final_url = target_url
 
+        http = session or requests
         try:
-            with requests.get(
+            with http.get(
                 target_url,
                 stream=True,
                 timeout=(initial_timeout, current_timeout),
@@ -1083,6 +1085,12 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         logging.error("No playlists to process.")
         return
 
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'VLC/3.0.14 LibVLC/3.0.14'})
+    adapter = HTTPAdapter(pool_maxsize=20)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
     group_suffix = group_title.replace('|', '').replace(' ', '') if group_title else 'AllGroups'
     if channel_pattern is not None:
         pattern = channel_pattern
@@ -1249,7 +1257,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                                     proxy_list=proxy_list,
                                     test_geoblock=test_geoblock,
                                     ffmpeg_available=ffmpeg_available,
-                                    backoff=backoff
+                                    backoff=backoff,
+                                    session=session
                                 )
                                 target_url = stream_url or stream_line if status == 'Alive' else None
                                 video_info = "Unknown"
@@ -1388,6 +1397,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                 for line in renamed_lines:
                     renamed_file.write(line + "\n")
             logging.info(f"Renamed playlist saved to {renamed_playlist_path}")
+
+    session.close()
 
     if f_output:
         f_output.close()
