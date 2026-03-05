@@ -1,0 +1,10 @@
+[project]
+name = "iptvchecker-python"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "ffmpeg-python>=0.2.0",
+    "pysocks>=1.7.1",
+    "requests>=2.32.5",
+]
