@@ -210,7 +210,7 @@ def test_with_proxy(url, proxy, timeout, retries=3):
                         if chunk:
                             return True
         except requests.RequestException as e:
-            logging.debug(f"Proxy test failed with {proxy} (attempt {attempt + 1}/{max(1, retries)}): {str(e)}")
+            logging.debug(f"Proxy test failed with {proxy} (attempt {attempt + 1}/{max(1, retries)}): {summarize_error(e)}")
 
         if attempt + 1 < max(1, retries):
             time.sleep(0.5 * (attempt + 1))
@@ -315,6 +315,22 @@ def load_proxy_list(proxy_file):
         logging.error("No valid proxy entries remain after validation.")
 
     return valid_proxies
+
+def summarize_error(exc):
+    msg = str(exc).lower()
+    if isinstance(exc, requests.Timeout):
+        return "Connection timed out"
+    if isinstance(exc, requests.ConnectionError):
+        if any(kw in msg for kw in ['dns', 'name or service not known', 'nodename nor servname', 'no such host', 'getaddrinfo failed']):
+            return "DNS resolution failed"
+        if 'ssl' in msg or 'tls' in msg or 'certificate' in msg or 'handshake' in msg:
+            return "SSL/TLS error"
+        if 'connection refused' in msg:
+            return "Connection refused"
+        return "Connection error"
+    if isinstance(exc, requests.TooManyRedirects):
+        return "Redirect loop"
+    return str(exc)[:80]
 
 def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_list=None, test_geoblock=False, ffmpeg_available=True, backoff='linear', session=None):
     headers = {
@@ -541,13 +557,13 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                     min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
                     return read_stream(resp, min_bytes)
         except requests.ConnectionError as exc:
-            logging.warning(f"Connection error occurred for {target_url}: {exc}")
+            logging.warning(f"{summarize_error(exc)} for {target_url}")
             return 'Retry', None
         except requests.Timeout as exc:
-            logging.warning(f"Timeout occurred for {target_url}: {exc}")
+            logging.warning(f"{summarize_error(exc)} for {target_url}")
             return 'Retry', None
         except requests.RequestException as e:
-            logging.error(f"Request failed: {str(e)}")
+            logging.error(f"Request failed for {target_url}: {summarize_error(e)}")
             return 'Dead', None
 
         if not playlist_text:
