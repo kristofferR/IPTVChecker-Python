@@ -500,7 +500,7 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             bytes_read += len(chunk)
             if bytes_read >= min_bytes:
                 logging.debug(f"Data received: {bytes_read} bytes")
-                return 'Alive', response.url
+                return 'Alive', response.url, None
 
         logging.debug(f"Data received: {bytes_read} bytes")
         if min_bytes >= min_data_threshold:
@@ -508,18 +508,18 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         else:
             fallback_threshold = max(32768, min_bytes // 2)  # Allow smaller segments to pass
         if bytes_read >= fallback_threshold:
-            return 'Alive', response.url
-        return 'Dead', None
+            return 'Alive', response.url, None
+        return 'Dead', None, 'Insufficient data received'
 
     def verify(target_url, current_timeout, depth, visited):
         if depth > max_playlist_depth:
             logging.debug("Maximum playlist nesting depth reached")
-            return 'Dead', None
+            return 'Dead', None, 'Max playlist depth exceeded'
 
         normalized_url = target_url.split('#')[0]
         if normalized_url in visited:
             logging.debug(f"Detected playlist loop at {target_url}")
-            return 'Dead', None
+            return 'Dead', None, 'Playlist loop detected'
         visited.add(normalized_url)
 
         playlist_text = None
@@ -535,15 +535,15 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
             ) as resp:
                 if resp.status_code in retryable_http_statuses:
                     logging.debug(f"Retryable HTTP status {resp.status_code} for {target_url}, retrying...")
-                    return 'Retry', None
+                    return 'Retry', None, f'HTTP {resp.status_code}'
                 if resp.status_code in geoblock_statuses:
                     logging.debug(f"Potential geoblock detected: HTTP {resp.status_code}")
-                    return 'Geoblocked', None
+                    return 'Geoblocked', None, None
                 if resp.status_code != 200:
                     logging.debug(f"HTTP status code not OK: {resp.status_code}")
                     if resp.status_code in secondary_geoblock_statuses:
-                        return 'Geoblocked', None
-                    return 'Dead', None
+                        return 'Geoblocked', None, None
+                    return 'Dead', None, f'HTTP {resp.status_code}'
 
                 content_type = resp.headers.get('Content-Type', '')
                 logging.debug(f"Content-Type: {content_type}")
@@ -557,28 +557,28 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                 else:
                     if content_type.lower().startswith('text/'):
                         logging.debug(f"Content-Type not recognized as stream: {content_type}")
-                        return 'Dead', None
+                        return 'Dead', None, f'Unrecognized content type: {content_type}'
                     logging.debug(f"Unrecognized Content-Type '{content_type}'. Attempting fallback stream read.")
                     min_bytes = min_data_threshold if depth == 0 else playlist_segment_threshold
                     return read_stream(resp, min_bytes)
         except requests.ConnectionError as exc:
             logging.warning(f"{summarize_error(exc)} for {target_url}")
-            return 'Retry', None
+            return 'Retry', None, summarize_error(exc)
         except requests.Timeout as exc:
             logging.warning(f"{summarize_error(exc)} for {target_url}")
-            return 'Retry', None
+            return 'Retry', None, summarize_error(exc)
         except requests.RequestException as e:
             logging.error(f"Request failed for {target_url}: {summarize_error(e)}")
-            return 'Dead', None
+            return 'Dead', None, summarize_error(e)
 
         if not playlist_text:
             logging.debug("Playlist response was empty")
-            return 'Dead', None
+            return 'Dead', None, 'Empty playlist response'
 
         next_url = extract_next_url(final_url, playlist_text)
         if not next_url:
             logging.debug("No media segments found in playlist")
-            return 'Dead', None
+            return 'Dead', None, 'No media segments in playlist'
 
         logging.debug(f"Following playlist entry: {next_url}")
         return verify(next_url, current_timeout, depth + 1, visited)
@@ -592,12 +592,14 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
 
     def attempt_check(current_timeout):
         total_attempts = max(1, retries)
+        last_reason = None
         for attempt in range(total_attempts):
             if cancel_event.is_set():
-                return 'Dead', None
+                return 'Dead', None, 'Cancelled'
             visited = set()
-            status, stream_url = verify(url, current_timeout, 0, visited)
+            status, stream_url, reason = verify(url, current_timeout, 0, visited)
             if status == 'Retry':
+                last_reason = reason
                 logging.debug(f"Retrying stream check for {url} ({attempt + 1}/{total_attempts})")
                 if attempt + 1 < total_attempts:
                     delay_seconds = get_retry_delay(attempt)
@@ -605,27 +607,27 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
                         logging.debug(f"Applying {backoff_mode} backoff delay of {delay_seconds}s")
                         time.sleep(delay_seconds)
                 continue
-            return status, stream_url
+            return status, stream_url, reason
         logging.error("Maximum retries exceeded for checking channel status")
-        return 'Dead', None
+        return 'Dead', None, last_reason or 'Max retries exceeded'
 
     # First attempt with the initial timeout
-    status, stream_url = attempt_check(timeout)
+    status, stream_url, error_reason = attempt_check(timeout)
 
     # If the channel is detected as dead and extended_timeout is specified, retry with extended timeout
     if status == 'Dead' and extended_timeout:
         logging.info(f"Channel initially detected as dead. Retrying with an extended timeout of {extended_timeout} seconds.")
-        status, stream_url = attempt_check(extended_timeout)
-    
+        status, stream_url, error_reason = attempt_check(extended_timeout)
+
     # If geoblocked and proxy testing is enabled, test with proxies
     if status == 'Geoblocked' and test_geoblock and proxy_list:
         logging.info(f"Testing geoblocked stream with {len(proxy_list)} proxies...")
         for proxy in random.sample(proxy_list, min(3, len(proxy_list))):  # Test up to 3 random proxies
             if test_with_proxy(url, proxy, timeout):
                 logging.info(f"Stream accessible via proxy {proxy} - confirming geoblock")
-                return 'Geoblocked (Confirmed)', None
+                return 'Geoblocked (Confirmed)', None, None
         logging.info("Stream not accessible via tested proxies")
-        return 'Geoblocked (Unconfirmed)', None
+        return 'Geoblocked (Unconfirmed)', None, None
 
     # Final Verification using ffmpeg/ffprobe for streams marked alive
     if status == 'Alive' and ffmpeg_available:
@@ -645,7 +647,7 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
         except Exception as e:
             logging.warning(f"Error verifying stream with ffmpeg ({verification_url}): {str(e)}; continuing with HTTP validation result")
 
-    return status, stream_url
+    return status, stream_url, error_reason
 
 def build_screenshot_filename(output_path, channel_index, channel_name, max_length=200):
     illegal_chars_pattern = r'[\\/:*?"<>|]'
@@ -1123,7 +1125,7 @@ def sanitize_csv_field(value):
         return "'" + normalized
     return normalized
 
-def file_log_entry(f_output, playlist_file, current_channel, total_channels, group_name, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info):
+def file_log_entry(f_output, playlist_file, current_channel, total_channels, group_name, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info, error_reason=None):
     if f_output is None:
         return
     safe_playlist = sanitize_csv_field(playlist_file)
@@ -1139,6 +1141,7 @@ def file_log_entry(f_output, playlist_file, current_channel, total_channels, gro
     fps_field = fps if fps is not None else ""
     audio_field = sanitize_csv_field(audio_info if audio_info else "Unknown")
     channel_id_field = sanitize_csv_field(channel_id if channel_id else "Unknown")
+    error_field = sanitize_csv_field(error_reason) if error_reason else ""
     csv.writer(f_output, lineterminator='\n').writerow([
         safe_playlist,
         current_channel,
@@ -1151,7 +1154,8 @@ def file_log_entry(f_output, playlist_file, current_channel, total_channels, gro
         bitrate_field,
         resolution_field,
         fps_field,
-        audio_field
+        audio_field,
+        error_field
     ])
     f_output.flush()
 
@@ -1225,6 +1229,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
     low_framerate_channels = []
     mislabeled_channels = []
     geoblocked_summary = {}
+    error_summary = {}
     url_dedup = UrlDeduplicator()
 
     f_output = None
@@ -1239,7 +1244,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         if output_file:
             try:
                 f_output = codecs.open(output_file, "w", "utf-8-sig")
-                f_output.write("Playlist,Channel Number,Total Channels in Playlist,Channel Status,Group Name,Channel Name,Channel ID,Codec,Bit Rate (kbps),Resolution,Frame Rate,Audio\n")
+                f_output.write("Playlist,Channel Number,Total Channels in Playlist,Channel Status,Group Name,Channel Name,Channel ID,Codec,Bit Rate (kbps),Resolution,Frame Rate,Audio,Error Reason\n")
             except OSError as exc:
                 logging.error(f"Unable to open output file '{output_file}': {exc}")
                 f_output = None
@@ -1414,7 +1419,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     'status': 'Dead', 'stream_url': None, 'target_url': None,
                     'video_info': 'Unknown', 'audio_info': 'Unknown',
                     'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
-                    'resolution': 'Unknown', 'fps': None,
+                    'resolution': 'Unknown', 'fps': None, 'error_reason': 'Cancelled',
                 }
             s_line = check_entry['stream_line']
             action, cached = url_dedup.get_or_start(s_line)
@@ -1428,7 +1433,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
             result = None
             try:
-                status, stream_url = check_channel_status(
+                status, stream_url, check_reason = check_channel_status(
                     s_line, timeout, retries=retries,
                     extended_timeout=extended_timeout,
                     proxy_list=proxy_list, test_geoblock=test_geoblock,
@@ -1461,14 +1466,15 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     'status': status, 'stream_url': stream_url, 'target_url': target_url,
                     'video_info': video_info, 'audio_info': audio_info,
                     'codec_name': codec_name, 'video_bitrate': video_bitrate,
-                    'resolution': resolution, 'fps': fps,
+                    'resolution': resolution, 'fps': fps, 'error_reason': check_reason,
                 }
-            except Exception:
+            except Exception as worker_exc:
                 result = {
                     'status': 'Dead', 'stream_url': None, 'target_url': None,
                     'video_info': 'Unknown', 'audio_info': 'Unknown',
                     'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
                     'resolution': 'Unknown', 'fps': None,
+                    'error_reason': summarize_error(worker_exc),
                 }
                 raise
             finally:
@@ -1491,12 +1497,13 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     try:
                         result = future.result()
                     except Exception as exc:
-                        logging.error(f"Error checking channel '{check_entry['channel_name']}': {exc}")
+                        logging.error(f"Error checking channel '{check_entry['channel_name']}': {summarize_error(exc)}")
                         result = {
                             'status': 'Dead', 'stream_url': None, 'target_url': None,
                             'video_info': 'Unknown', 'audio_info': 'Unknown',
                             'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
                             'resolution': 'Unknown', 'fps': None,
+                            'error_reason': summarize_error(exc),
                         }
 
                     check_entry['result'] = result
@@ -1516,6 +1523,9 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
 
                         if 'Geoblocked' in status:
                             geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+                        elif status == 'Dead':
+                            reason = result.get('error_reason') or 'Unknown'
+                            error_summary[reason] = error_summary.get(reason, 0) + 1
 
                         console_log_entry(
                             playlist_file, check_entry['channel_index'], total_channels,
@@ -1526,7 +1536,8 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                             f_output, playlist_file, check_entry['channel_index'], total_channels,
                             check_entry['group_value'], check_entry['channel_name'], check_entry['channel_id'],
                             status, result['codec_name'], result['video_bitrate'],
-                            result['resolution'], result['fps'], result['audio_info']
+                            result['resolution'], result['fps'], result['audio_info'],
+                            error_reason=result.get('error_reason')
                         )
 
                     write_resume_entry(check_entry['stream_line'], check_entry['channel_index'])
@@ -1640,6 +1651,13 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         for playlist_file, count in geoblocked_summary.items():
             print(f"{playlist_file}: {count} channels detected")
             logging.info(f"{playlist_file}: {count} geoblocked channels detected")
+
+    if error_summary:
+        total_dead = sum(error_summary.values())
+        print(f"\n\033[93mDead Channels Breakdown ({total_dead} total):\033[0m")
+        for reason, count in sorted(error_summary.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {reason}: {count}")
+            logging.info(f"Dead channels - {reason}: {count}")
 
 def main():
     print_header()
