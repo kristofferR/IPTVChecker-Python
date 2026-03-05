@@ -19,6 +19,7 @@ from requests.adapters import HTTPAdapter
 
 ACTIVE_SUBPROCESSES = set()
 _subprocess_lock = threading.Lock()
+cancel_event = threading.Event()
 
 def print_header():
     header_text = """
@@ -104,8 +105,8 @@ def run_managed_subprocess(command, timeout):
 
 def handle_sigint(signum, frame):
     logging.info("Interrupt received, stopping...")
+    cancel_event.set()
     cleanup_active_subprocesses()
-    sys.exit(130)
 
 signal.signal(signal.SIGINT, handle_sigint)
 
@@ -571,6 +572,8 @@ def check_channel_status(url, timeout, retries=6, extended_timeout=None, proxy_l
     def attempt_check(current_timeout):
         total_attempts = max(1, retries)
         for attempt in range(total_attempts):
+            if cancel_event.is_set():
+                return 'Dead', None
             visited = set()
             status, stream_url = verify(url, current_timeout, 0, visited)
             if status == 'Retry':
@@ -1359,6 +1362,13 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         diag_semaphore = threading.Semaphore(min(workers, 4))
 
         def check_channel_worker(check_entry):
+            if cancel_event.is_set():
+                return {
+                    'status': 'Dead', 'stream_url': None, 'target_url': None,
+                    'video_info': 'Unknown', 'audio_info': 'Unknown',
+                    'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
+                    'resolution': 'Unknown', 'fps': None,
+                }
             s_line = check_entry['stream_line']
             action, cached = url_dedup.get_or_start(s_line)
             if action == 'cached':
@@ -1419,52 +1429,75 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     url_dedup.set_result(s_line, result)
             return result
 
+        cancelled = False
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {executor.submit(check_channel_worker, e): e for e in entries_to_check}
-            for future in as_completed(future_map):
-                check_entry = future_map[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    logging.error(f"Error checking channel '{check_entry['channel_name']}': {exc}")
-                    result = {
-                        'status': 'Dead', 'stream_url': None, 'target_url': None,
-                        'video_info': 'Unknown', 'audio_info': 'Unknown',
-                        'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
-                        'resolution': 'Unknown', 'fps': None,
-                    }
+            try:
+                for future in as_completed(future_map):
+                    if cancel_event.is_set():
+                        for pending in future_map:
+                            pending.cancel()
+                        cancelled = True
+                        break
 
-                check_entry['result'] = result
-                status = result['status']
+                    check_entry = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logging.error(f"Error checking channel '{check_entry['channel_name']}': {exc}")
+                        result = {
+                            'status': 'Dead', 'stream_url': None, 'target_url': None,
+                            'video_info': 'Unknown', 'audio_info': 'Unknown',
+                            'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
+                            'resolution': 'Unknown', 'fps': None,
+                        }
 
-                with print_lock:
-                    if status == 'Alive' and ffprobe_available:
-                        mismatches = check_label_mismatch(check_entry['channel_name'], result['resolution'])
-                        if result['fps'] is not None and result['fps'] < 29:
-                            low_framerate_channels.append(
-                                f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - \033[91m{result['fps']}fps\033[0m"
-                            )
-                        if mismatches:
-                            mislabeled_channels.append(
-                                f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - {', '.join(mismatches)}"
-                            )
+                    check_entry['result'] = result
+                    status = result['status']
 
-                    if 'Geoblocked' in status:
-                        geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+                    with print_lock:
+                        if status == 'Alive' and ffprobe_available:
+                            mismatches = check_label_mismatch(check_entry['channel_name'], result['resolution'])
+                            if result['fps'] is not None and result['fps'] < 29:
+                                low_framerate_channels.append(
+                                    f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - \033[91m{result['fps']}fps\033[0m"
+                                )
+                            if mismatches:
+                                mislabeled_channels.append(
+                                    f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - {', '.join(mismatches)}"
+                                )
 
-                    console_log_entry(
-                        playlist_file, check_entry['channel_index'], total_channels,
-                        check_entry['channel_name'], status, result['video_info'], result['audio_info'],
-                        max_name_length, use_padding
-                    )
-                    file_log_entry(
-                        f_output, playlist_file, check_entry['channel_index'], total_channels,
-                        check_entry['group_value'], check_entry['channel_name'], check_entry['channel_id'],
-                        status, result['codec_name'], result['video_bitrate'],
-                        result['resolution'], result['fps'], result['audio_info']
-                    )
+                        if 'Geoblocked' in status:
+                            geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
 
-                write_resume_entry(check_entry['stream_line'], check_entry['channel_index'])
+                        console_log_entry(
+                            playlist_file, check_entry['channel_index'], total_channels,
+                            check_entry['channel_name'], status, result['video_info'], result['audio_info'],
+                            max_name_length, use_padding
+                        )
+                        file_log_entry(
+                            f_output, playlist_file, check_entry['channel_index'], total_channels,
+                            check_entry['group_value'], check_entry['channel_name'], check_entry['channel_id'],
+                            status, result['codec_name'], result['video_bitrate'],
+                            result['resolution'], result['fps'], result['audio_info']
+                        )
+
+                    write_resume_entry(check_entry['stream_line'], check_entry['channel_index'])
+            except KeyboardInterrupt:
+                cancel_event.set()
+                for pending in future_map:
+                    pending.cancel()
+                cancelled = True
+                logging.info("Cancelling remaining checks...")
+
+        if cancelled:
+            checkpoint_writer.close()
+            cleanup_active_subprocesses()
+            if f_output:
+                f_output.close()
+            session.close()
+            print("\n\033[93mInterrupted. Checkpoint saved for resume.\033[0m")
+            sys.exit(130)
 
         # Post-processing: build split lists and patch rename in original order
         for check_entry in entries_to_check:
