@@ -13,10 +13,12 @@ import codecs
 import csv
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from requests.adapters import HTTPAdapter
 
 ACTIVE_SUBPROCESSES = set()
+_subprocess_lock = threading.Lock()
 
 def print_header():
     header_text = """
@@ -65,9 +67,12 @@ def terminate_process(process):
             pass
 
 def cleanup_active_subprocesses():
-    for process in list(ACTIVE_SUBPROCESSES):
+    with _subprocess_lock:
+        procs = list(ACTIVE_SUBPROCESSES)
+    for process in procs:
         terminate_process(process)
-        ACTIVE_SUBPROCESSES.discard(process)
+    with _subprocess_lock:
+        ACTIVE_SUBPROCESSES.clear()
 
 def run_managed_subprocess(command, timeout):
     popen_kwargs = {
@@ -84,7 +89,8 @@ def run_managed_subprocess(command, timeout):
     process = None
     try:
         process = subprocess.Popen(command, **popen_kwargs)
-        ACTIVE_SUBPROCESSES.add(process)
+        with _subprocess_lock:
+            ACTIVE_SUBPROCESSES.add(process)
         stdout, stderr = process.communicate(timeout=timeout)
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
@@ -93,7 +99,8 @@ def run_managed_subprocess(command, timeout):
         raise
     finally:
         if process is not None:
-            ACTIVE_SUBPROCESSES.discard(process)
+            with _subprocess_lock:
+                ACTIVE_SUBPROCESSES.discard(process)
 
 def handle_sigint(signum, frame):
     logging.info("Interrupt received, stopping...")
@@ -1116,7 +1123,7 @@ def console_log_entry(playlist_file, current_channel, total_channels, channel_na
             print(f"{color}{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}\033[0m")
             logging.info(f"{prefix}{current_channel}/{total_channels} {status_symbol} {channel_name}")
 
-def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6):
+def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=False, rename=False, skip_screenshots=False, output_file=None, channel_search=None, channel_pattern=None, proxy_list=None, test_geoblock=False, profile_bitrate=False, ffmpeg_available=True, ffprobe_available=True, backoff='linear', retries=6, workers=4):
     if not playlists:
         logging.error("No playlists to process.")
         return
@@ -1219,6 +1226,7 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         pending_metadata_lines = []
         pending_selected = False
         checkpoint_writer = CheckpointWriter(log_file)
+        entries_to_check = []
 
         def write_resume_entry(identifier, channel_index):
             if not identifier or identifier in written_resume_entries:
@@ -1273,102 +1281,21 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                         identifier = stream_line
                         if identifier not in processed_channels:
                             current_channel += 1
-                            cached_result = url_result_cache.get(stream_line)
-                            if cached_result:
-                                logging.debug(f"Reusing cached check result for duplicate URL: {stream_line}")
-                                status = cached_result['status']
-                                stream_url = cached_result['stream_url']
-                                target_url = cached_result.get('target_url')
-                                video_info = cached_result['video_info']
-                                audio_info = cached_result['audio_info']
-                                codec_name = cached_result['codec_name']
-                                video_bitrate = cached_result['video_bitrate']
-                                resolution = cached_result['resolution']
-                                fps = cached_result['fps']
-                            else:
-                                status, stream_url = check_channel_status(
-                                    stream_line,
-                                    timeout,
-                                    retries=retries,
-                                    extended_timeout=extended_timeout,
-                                    proxy_list=proxy_list,
-                                    test_geoblock=test_geoblock,
-                                    ffmpeg_available=ffmpeg_available,
-                                    backoff=backoff,
-                                    session=session
-                                )
-                                target_url = stream_url or stream_line if status == 'Alive' else None
-                                video_info = "Unknown"
-                                audio_info = "Unknown"
-                                codec_name = "Unknown"
-                                video_bitrate = "Unknown"
-                                resolution = "Unknown"
-                                fps = None
-                                if status == 'Alive' and ffprobe_available and target_url:
-                                    codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
-                                        target_url,
-                                        profile_bitrate=profile_bitrate and ffmpeg_available
-                                    )
-                                    video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
-                                    audio_info = get_audio_bitrate(target_url)
-                                url_result_cache[stream_line] = {
-                                    'status': status,
-                                    'stream_url': stream_url,
-                                    'target_url': target_url,
-                                    'video_info': video_info,
-                                    'audio_info': audio_info,
-                                    'codec_name': codec_name,
-                                    'video_bitrate': video_bitrate,
-                                    'resolution': resolution,
-                                    'fps': fps
-                                }
-
-                            if status == 'Alive' and ffprobe_available:
-                                mismatches = check_label_mismatch(channel_name, resolution)
-                                if fps is not None and fps < 29:
-                                    low_framerate_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - \033[91m{fps}fps\033[0m")
-                                if mismatches:
-                                    mislabeled_channels.append(f"{playlist_file}: {current_channel}/{total_channels} {channel_name} - {', '.join(mismatches)}")
-
-                            channel_id = get_channel_id(stream_line)
-                            group_value = get_group_name(pending_extinf)
-                            video_info = "Unknown"
-                            audio_info = "Unknown"
-                            if cached_result:
-                                video_info = cached_result['video_info']
-                                audio_info = cached_result['audio_info']
-                            elif status == 'Alive':
-                                video_info = url_result_cache[stream_line]['video_info']
-                                audio_info = url_result_cache[stream_line]['audio_info']
-
-                            if status == 'Alive':
-                                if not skip_screenshots and output_folder and ffmpeg_available:
-                                    file_name = build_screenshot_filename(output_folder, current_channel, channel_name)
-                                    target_url = target_url or stream_line
-                                    capture_frame(target_url, output_folder, file_name)
-
-                                if rename:
-                                    renamed_channel_name = f"{channel_name} ({video_info} | Audio: {audio_info})"
-                                    extinf_parts = pending_extinf.split(',', 1)
-                                    if len(extinf_parts) > 1:
-                                        extinf_parts[1] = renamed_channel_name
-                                        output_extinf_line = ','.join(extinf_parts)
-
-                                if split:
-                                    working_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
-                            elif 'Geoblocked' in status:
-                                if split:
-                                    geoblocked_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
-                                geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
-                            else:
-                                if split:
-                                    dead_channels.append([output_extinf_line, *channel_metadata_lines, stream_line])
-
-                            console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding)
+                            entry = {
+                                'channel_index': current_channel,
+                                'extinf_line': pending_extinf,
+                                'channel_name': channel_name,
+                                'metadata_lines': list(channel_metadata_lines),
+                                'stream_line': stream_line,
+                                'group_value': get_group_name(pending_extinf),
+                                'channel_id': get_channel_id(stream_line),
+                                'result': None,
+                            }
+                            if renamed_lines is not None:
+                                entry['renamed_line_idx'] = len(renamed_lines)
+                            entries_to_check.append(entry)
                             processed_channels.add(identifier)
                             processed_channel_indices[identifier] = current_channel
-                            write_resume_entry(identifier, current_channel)
-                            file_log_entry(f_output, playlist_file, current_channel, total_channels, group_value, channel_name, channel_id, status, codec_name, video_bitrate, resolution, fps, audio_info)
                         else:
                             logging.debug(f"Skipping previously processed channel: {channel_name}")
                             resume_index = processed_channel_indices.get(identifier)
@@ -1395,12 +1322,136 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
             checkpoint_writer.close()
             continue
 
-        checkpoint_writer.close()
-
         if pending_extinf is not None:
             if pending_selected:
                 logging.warning(f"No stream URL found for channel '{pending_channel_name}' in {playlist_file}")
             append_pending_entry(pending_extinf, pending_metadata_lines)
+
+        # Concurrent check phase
+        print_lock = threading.Lock()
+        diag_semaphore = threading.Semaphore(min(workers, 4))
+
+        def check_channel_worker(check_entry):
+            s_line = check_entry['stream_line']
+            cached = url_result_cache.get(s_line)
+            if cached:
+                logging.debug(f"Reusing cached check result for duplicate URL: {s_line}")
+                return cached
+
+            status, stream_url = check_channel_status(
+                s_line, timeout, retries=retries,
+                extended_timeout=extended_timeout,
+                proxy_list=proxy_list, test_geoblock=test_geoblock,
+                ffmpeg_available=ffmpeg_available, backoff=backoff,
+                session=session
+            )
+
+            target_url = (stream_url or s_line) if status == 'Alive' else None
+            video_info = "Unknown"
+            audio_info = "Unknown"
+            codec_name = "Unknown"
+            video_bitrate = "Unknown"
+            resolution = "Unknown"
+            fps = None
+
+            if status == 'Alive' and ffprobe_available and target_url:
+                with diag_semaphore:
+                    codec_name, video_bitrate, resolution, fps = get_detailed_stream_info(
+                        target_url, profile_bitrate=profile_bitrate and ffmpeg_available
+                    )
+                    video_info = format_stream_info(codec_name, video_bitrate, resolution, fps)
+                    audio_info = get_audio_bitrate(target_url)
+
+            if status == 'Alive' and not skip_screenshots and output_folder and ffmpeg_available:
+                with diag_semaphore:
+                    file_name = build_screenshot_filename(output_folder, check_entry['channel_index'], check_entry['channel_name'])
+                    capture_frame(target_url or s_line, output_folder, file_name)
+
+            result = {
+                'status': status, 'stream_url': stream_url, 'target_url': target_url,
+                'video_info': video_info, 'audio_info': audio_info,
+                'codec_name': codec_name, 'video_bitrate': video_bitrate,
+                'resolution': resolution, 'fps': fps,
+            }
+            url_result_cache[s_line] = result
+            return result
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(check_channel_worker, e): e for e in entries_to_check}
+            for future in as_completed(future_map):
+                check_entry = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logging.error(f"Error checking channel '{check_entry['channel_name']}': {exc}")
+                    result = {
+                        'status': 'Dead', 'stream_url': None, 'target_url': None,
+                        'video_info': 'Unknown', 'audio_info': 'Unknown',
+                        'codec_name': 'Unknown', 'video_bitrate': 'Unknown',
+                        'resolution': 'Unknown', 'fps': None,
+                    }
+
+                check_entry['result'] = result
+                status = result['status']
+
+                with print_lock:
+                    if status == 'Alive' and ffprobe_available:
+                        mismatches = check_label_mismatch(check_entry['channel_name'], result['resolution'])
+                        if result['fps'] is not None and result['fps'] < 29:
+                            low_framerate_channels.append(
+                                f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - \033[91m{result['fps']}fps\033[0m"
+                            )
+                        if mismatches:
+                            mislabeled_channels.append(
+                                f"{playlist_file}: {check_entry['channel_index']}/{total_channels} {check_entry['channel_name']} - {', '.join(mismatches)}"
+                            )
+
+                    if 'Geoblocked' in status:
+                        geoblocked_summary[playlist_file] = geoblocked_summary.get(playlist_file, 0) + 1
+
+                    console_log_entry(
+                        playlist_file, check_entry['channel_index'], total_channels,
+                        check_entry['channel_name'], status, result['video_info'], result['audio_info'],
+                        max_name_length, use_padding
+                    )
+                    file_log_entry(
+                        f_output, playlist_file, check_entry['channel_index'], total_channels,
+                        check_entry['group_value'], check_entry['channel_name'], check_entry['channel_id'],
+                        status, result['codec_name'], result['video_bitrate'],
+                        result['resolution'], result['fps'], result['audio_info']
+                    )
+
+                write_resume_entry(check_entry['stream_line'], check_entry['channel_index'])
+
+        # Post-processing: build split lists and patch rename in original order
+        for check_entry in entries_to_check:
+            result = check_entry.get('result', {})
+            status = result.get('status', 'Dead')
+            output_extinf = check_entry['extinf_line']
+            metadata_lines = check_entry['metadata_lines']
+            s_line = check_entry['stream_line']
+
+            if status == 'Alive' and rename and renamed_lines is not None:
+                video_info = result.get('video_info', 'Unknown')
+                audio_info = result.get('audio_info', 'Unknown')
+                renamed_channel_name = f"{check_entry['channel_name']} ({video_info} | Audio: {audio_info})"
+                extinf_parts = output_extinf.split(',', 1)
+                if len(extinf_parts) > 1:
+                    extinf_parts[1] = renamed_channel_name
+                    output_extinf = ','.join(extinf_parts)
+                if 'renamed_line_idx' in check_entry:
+                    renamed_lines[check_entry['renamed_line_idx']] = output_extinf
+
+            if split:
+                entry_lines = [output_extinf, *metadata_lines, s_line]
+                if status == 'Alive':
+                    working_channels.append(entry_lines)
+                elif 'Geoblocked' in status:
+                    geoblocked_channels.append(entry_lines)
+                else:
+                    dead_channels.append(entry_lines)
+
+        checkpoint_writer.close()
 
         if split:
             working_playlist_path = os.path.join(playlist_dir, f"{base_playlist_name}_working.m3u8")
@@ -1486,6 +1537,7 @@ def main():
     parser.add_argument("-skip_screenshots", action="store_true", help="Skip capturing screenshots for alive channels")
     parser.add_argument("--profile-bitrate", "-b", action="store_true", help="Profile average video bitrate (slower, uses a 10-second ffmpeg sample)")
     parser.add_argument("--backoff", "-B", type=str, choices=["none", "linear", "exponential"], default="linear", help="Retry backoff strategy: none, linear (1s,2s,3s...), exponential (1s,2s,4s...)")
+    parser.add_argument("--workers", "-w", type=int, default=4, help="Number of concurrent workers for channel checking (1-20, default: 4)")
 
     args = parser.parse_args()
 
@@ -1495,6 +1547,8 @@ def main():
         parser.error("`-extended/--extended` must be between 1 and 600 seconds.")
     if not 0 <= args.retries <= 10:
         parser.error("`--retries/-R` must be between 0 and 10.")
+    if not 1 <= args.workers <= 20:
+        parser.error("`--workers/-w` must be between 1 and 20.")
 
     try:
         channel_pattern = compile_channel_pattern(args.channel_search)
@@ -1566,7 +1620,8 @@ def main():
         ffmpeg_available=ffmpeg_available,
         ffprobe_available=ffprobe_available,
         backoff=args.backoff,
-        retries=args.retries
+        retries=args.retries,
+        workers=args.workers
     )
 
 if __name__ == "__main__":
