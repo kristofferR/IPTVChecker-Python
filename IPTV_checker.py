@@ -239,7 +239,7 @@ def load_proxy_list(proxy_file):
 
         parsed = urlparse(candidate)
         scheme = parsed.scheme.lower()
-        if scheme not in {'http', 'https', 'socks4', 'socks5'}:
+        if scheme not in {'http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h'}:
             return None, f"unsupported proxy scheme '{parsed.scheme}'"
         if not parsed.hostname:
             return None, "missing proxy host"
