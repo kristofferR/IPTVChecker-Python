@@ -304,15 +304,20 @@ def load_proxy_list(proxy_file):
     except Exception as e:
         logging.error(f"Error loading proxy file: {str(e)}")
 
-    for proxy in proxies:
+    skipped = 0
+    for idx, proxy in enumerate(proxies, 1):
         validated_proxy, error_message = validate_proxy_entry(proxy)
         if error_message:
-            logging.error(f"Invalid proxy entry '{proxy}': {error_message}")
+            logging.warning(f"Proxy entry #{idx} '{proxy}': {error_message}")
+            skipped += 1
             continue
         valid_proxies.append(validated_proxy)
 
-    if proxies and not valid_proxies:
-        logging.error("No valid proxy entries remain after validation.")
+    if proxies:
+        if valid_proxies:
+            logging.info(f"Loaded {len(valid_proxies)} of {len(proxies)} proxies ({skipped} skipped)")
+        else:
+            logging.error("No valid proxy entries remain after validation.")
 
     return valid_proxies
 
