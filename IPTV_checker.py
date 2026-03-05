@@ -1153,6 +1153,7 @@ def file_log_entry(f_output, playlist_file, current_channel, total_channels, gro
         fps_field,
         audio_field
     ])
+    f_output.flush()
 
 def console_log_entry(playlist_file, current_channel, total_channels, channel_name, status, video_info, audio_info, max_name_length, use_padding):
     # Set colors and symbols based on status
