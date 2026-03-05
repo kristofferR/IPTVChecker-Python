@@ -12,6 +12,7 @@ import json
 import codecs
 import csv
 import re
+import threading
 from urllib.parse import urljoin, urlparse
 from requests.adapters import HTTPAdapter
 
@@ -999,6 +1000,41 @@ def write_log_entry(log_file, entry):
     with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
         f.write(entry + "\n")
 
+class CheckpointWriter:
+    def __init__(self, log_file, flush_interval=0.25, flush_threshold=128):
+        self._log_file = log_file
+        self._flush_interval = flush_interval
+        self._flush_threshold = flush_threshold
+        self._buffer = []
+        self._lock = threading.Lock()
+        self._last_flush = time.monotonic()
+
+    def write(self, entry):
+        with self._lock:
+            self._buffer.append(entry)
+            now = time.monotonic()
+            if len(self._buffer) >= self._flush_threshold or (now - self._last_flush) >= self._flush_interval:
+                self._flush_locked()
+
+    def _flush_locked(self):
+        if not self._buffer:
+            return
+        try:
+            with open(self._log_file, 'a', encoding='utf-8', errors='replace') as f:
+                for entry in self._buffer:
+                    f.write(entry + "\n")
+        except OSError as exc:
+            logging.error(f"Failed to flush checkpoint log '{self._log_file}': {exc}")
+        self._buffer.clear()
+        self._last_flush = time.monotonic()
+
+    def flush(self):
+        with self._lock:
+            self._flush_locked()
+
+    def close(self):
+        self.flush()
+
 def sanitize_csv_field(value):
     if value is None:
         return ""
@@ -1182,11 +1218,12 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
         pending_channel_name = None
         pending_metadata_lines = []
         pending_selected = False
+        checkpoint_writer = CheckpointWriter(log_file)
 
         def write_resume_entry(identifier, channel_index):
             if not identifier or identifier in written_resume_entries:
                 return
-            write_log_entry(log_file, f"{channel_index} - {identifier}")
+            checkpoint_writer.write(f"{channel_index} - {identifier}")
             written_resume_entries.add(identifier)
 
         def append_pending_entry(extinf_line, metadata_lines, stream_line=None):
@@ -1347,13 +1384,18 @@ def parse_m3u8_files(playlists, group_title, timeout, extended_timeout, split=Fa
                     pending_metadata_lines = []
         except FileNotFoundError:
             logging.error(f"M3U file not found: {file_path}. Please check the path and try again.")
+            checkpoint_writer.close()
             continue
         except PermissionError:
             logging.error(f"Permission denied: Cannot read M3U file '{file_path}'")
+            checkpoint_writer.close()
             continue
         except Exception as exc:
             logging.error(f"Failed to parse M3U file '{file_path}': {exc}")
+            checkpoint_writer.close()
             continue
+
+        checkpoint_writer.close()
 
         if pending_extinf is not None:
             if pending_selected:
